@@ -88,11 +88,7 @@ pub fn get_actual_port() -> Option<u16> {
 }
 
 fn build_service_refresh_policies(cfg: &super::config::UserConfig) -> Vec<ServiceRefreshPolicy> {
-    vec![
-        ServiceRefreshPolicy {
-            key: "antigravity",
-            interval_minutes: cfg.auto_refresh_minutes,
-        },
+    let mut policies = vec![
         ServiceRefreshPolicy {
             key: "codex",
             interval_minutes: cfg.codex_auto_refresh_minutes,
@@ -100,10 +96,6 @@ fn build_service_refresh_policies(cfg: &super::config::UserConfig) -> Vec<Servic
         ServiceRefreshPolicy {
             key: "ghcp",
             interval_minutes: cfg.ghcp_auto_refresh_minutes,
-        },
-        ServiceRefreshPolicy {
-            key: "windsurf",
-            interval_minutes: cfg.windsurf_auto_refresh_minutes,
         },
         ServiceRefreshPolicy {
             key: "kiro",
@@ -137,7 +129,20 @@ fn build_service_refresh_policies(cfg: &super::config::UserConfig) -> Vec<Servic
             key: "zed",
             interval_minutes: cfg.zed_auto_refresh_minutes,
         },
-    ]
+    ];
+    if is_antigravity_series_runtime_ready() {
+        policies.push(ServiceRefreshPolicy {
+            key: "antigravity",
+            interval_minutes: cfg.auto_refresh_minutes,
+        });
+    }
+    if super::platform_package::is_platform_package_installed("windsurf") {
+        policies.push(ServiceRefreshPolicy {
+            key: "windsurf",
+            interval_minutes: cfg.windsurf_auto_refresh_minutes,
+        });
+    }
+    policies
 }
 
 fn needs_auth_refresh_trigger(now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -155,35 +160,127 @@ fn needs_auth_refresh_trigger(now: chrono::DateTime<chrono::Utc>) -> bool {
 async fn run_refresh_for_service(policy: ServiceRefreshPolicy) -> Result<(), String> {
     match policy.key {
         "antigravity" => {
-            super::account::refresh_all_quotas_logic(super::account::QuotaRefreshTrigger::Auto)
-                .await
+            if !is_antigravity_series_runtime_ready() {
+                return Ok(());
+            }
+            super::platform_adapter::call_antigravity_series_with_timeout::<serde_json::Value>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "codex" => {
+            if !super::platform_package::is_platform_package_runtime_ready("codex") {
+                return Ok(());
+            }
+            super::platform_adapter::call_codex_with_timeout::<i32>(
+                "quota.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "ghcp" => {
+            if !super::platform_package::is_platform_package_installed("github-copilot") {
+                return Ok(());
+            }
+            super::platform_adapter::call_github_copilot_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "windsurf" => {
+            if !super::platform_package::is_platform_package_installed("windsurf") {
+                return Ok(());
+            }
+            super::platform_adapter::call_windsurf_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "kiro" => {
+            if !super::platform_package::is_platform_package_installed("kiro") {
+                return Ok(());
+            }
+            super::platform_adapter::call_kiro_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "cursor" => {
+            if !super::platform_package::is_platform_package_installed("cursor") {
+                return Ok(());
+            }
+            super::platform_adapter::call_cursor_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "gemini" => {
+            if !super::platform_package::is_platform_package_installed("gemini") {
+                return Ok(());
+            }
+            super::platform_adapter::call_gemini_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "codebuddy" => {
+            if !super::platform_package::is_platform_package_installed("codebuddy") {
+                return Ok(());
+            }
+            super::platform_adapter::call_codebuddy_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "codebuddy_cn" => {
+            if !super::platform_package::is_platform_package_installed("codebuddy_cn") {
+                return Ok(());
+            }
+            super::platform_adapter::call_codebuddy_cn_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "qoder" => {
+            if !super::platform_package::is_platform_package_installed("qoder") {
+                return Ok(());
+            }
+            super::platform_adapter::call_qoder_with_timeout::<i32>(
+                "accounts.refreshAll",
+                serde_json::json!({}),
+                Duration::from_secs(180),
+            )
+            .map(|_| ())
+        }
+        "trae" => {
+            if !super::platform_package::is_platform_package_installed("trae") {
+                return Ok(());
+            }
+            super::platform_adapter::call_trae::<i32>("accounts.refreshAll", serde_json::json!({}))
                 .map(|_| ())
         }
-        "codex" => super::codex_quota::refresh_all_quotas().await.map(|_| ()),
-        "ghcp" => super::github_copilot_account::refresh_all_tokens()
-            .await
-            .map(|_| ()),
-        "windsurf" => super::windsurf_account::refresh_all_tokens()
-            .await
-            .map(|_| ()),
-        "kiro" => super::kiro_account::refresh_all_tokens().await.map(|_| ()),
-        "cursor" => super::cursor_account::refresh_all_tokens()
-            .await
-            .map(|_| ()),
-        "gemini" => super::gemini_account::refresh_all_tokens()
-            .await
-            .map(|_| ()),
-        "codebuddy" => super::codebuddy_account::refresh_all_tokens()
-            .await
-            .map(|_| ()),
-        "codebuddy_cn" => super::codebuddy_cn_account::refresh_all_tokens()
-            .await
-            .map(|_| ()),
-        "qoder" => super::qoder_oauth::refresh_all_accounts_from_openapi()
-            .await
-            .map(|_| ()),
-        "trae" => super::trae_account::refresh_all_tokens().await.map(|_| ()),
-        "zed" => super::zed_account::refresh_all_accounts().await.map(|_| ()),
+        "zed" => super::platform_adapter::call_zed::<Vec<ZedAccount>>(
+            "accounts.refreshAll",
+            serde_json::json!({}),
+        )
+        .map(|_| ()),
         _ => Err(format!("未知服务: {}", policy.key)),
     }
 }
@@ -581,23 +678,17 @@ fn parse_bool_query(value: &str) -> bool {
 
 fn build_report_rows() -> Vec<ReportRow> {
     let mut rows = Vec::new();
-    append_antigravity_rows(&mut rows);
+    if is_antigravity_series_runtime_ready() {
+        append_antigravity_rows(&mut rows);
+    }
     append_codex_rows(&mut rows);
     append_github_copilot_rows(&mut rows);
     append_windsurf_rows(&mut rows);
     append_kiro_rows(&mut rows);
     append_cursor_rows(&mut rows);
     append_gemini_rows(&mut rows);
-    append_codebuddy_rows(
-        &mut rows,
-        "CodeBuddy",
-        super::codebuddy_account::list_accounts(),
-    );
-    append_codebuddy_rows(
-        &mut rows,
-        "CodeBuddy CN",
-        super::codebuddy_cn_account::list_accounts(),
-    );
+    append_codebuddy_rows(&mut rows, "CodeBuddy", load_codebuddy_accounts());
+    append_codebuddy_rows(&mut rows, "CodeBuddy CN", load_codebuddy_cn_accounts());
     append_qoder_rows(&mut rows);
     append_trae_rows(&mut rows);
     append_workbuddy_rows(&mut rows);
@@ -619,8 +710,17 @@ fn build_report_rows() -> Vec<ReportRow> {
     rows
 }
 
+fn is_antigravity_series_runtime_ready() -> bool {
+    super::platform_package::is_platform_package_runtime_ready("antigravity")
+        || super::platform_package::is_platform_package_runtime_ready("antigravity_ide")
+}
+
 fn append_antigravity_rows(rows: &mut Vec<ReportRow>) {
-    match super::account::list_accounts() {
+    match super::platform_adapter::call_antigravity_series_with_timeout::<Vec<crate::models::Account>>(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(30),
+    ) {
         Ok(accounts) => {
             for account in accounts {
                 let status = if account.disabled {
@@ -694,7 +794,18 @@ fn append_antigravity_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_codex_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::codex_account::list_accounts();
+    if !super::platform_package::is_platform_package_runtime_ready("codex") {
+        return;
+    }
+
+    let accounts = super::platform_adapter::call_codex_with_timeout::<
+        Vec<crate::models::codex::CodexAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default();
     for account in accounts {
         let account_name = account.email.clone();
         let mut status = "normal".to_string();
@@ -757,7 +868,14 @@ fn append_codex_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_github_copilot_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::github_copilot_account::list_accounts();
+    let accounts = super::platform_adapter::call_github_copilot_with_timeout::<
+        Vec<crate::models::github_copilot::GitHubCopilotAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default();
     for account in accounts {
         let account_name = account
             .github_email
@@ -795,7 +913,17 @@ fn append_github_copilot_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_windsurf_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::windsurf_account::list_accounts();
+    if !super::platform_package::is_platform_package_installed("windsurf") {
+        return;
+    }
+    let accounts = super::platform_adapter::call_windsurf_with_timeout::<
+        Vec<crate::models::windsurf::WindsurfAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default();
     for account in accounts {
         let account_name = account
             .github_email
@@ -809,7 +937,7 @@ fn append_windsurf_rows(rows: &mut Vec<ReportRow>) {
         if let Some(snapshots) = account.copilot_quota_snapshots.as_ref() {
             pushed = append_copilot_snapshot_rows(
                 rows,
-                "Windsurf",
+                "Devin",
                 &account_name,
                 snapshots,
                 &reset,
@@ -831,7 +959,7 @@ fn append_windsurf_rows(rows: &mut Vec<ReportRow>) {
 
         if pushed == 0 {
             rows.push(make_row(
-                "Windsurf",
+                "Devin",
                 &account_name,
                 "Quota",
                 "-",
@@ -954,7 +1082,7 @@ fn append_windsurf_plan_status_candidate_rows(
             status,
         );
         rows.push(make_row(
-            "Windsurf",
+            "Devin",
             account,
             "Extra usage balance",
             "-",
@@ -1081,7 +1209,7 @@ fn push_windsurf_quota_percent_row(
     };
 
     rows.push(make_row(
-        "Windsurf",
+        "Devin",
         account,
         metric,
         &percent_text(used),
@@ -1114,7 +1242,7 @@ fn push_windsurf_credit_row(
         let remaining = (total - used_normalized).max(0.0);
         let used_percent = clamp_percent((used_normalized / total) * 100.0);
         rows.push(make_row(
-            "Windsurf",
+            "Devin",
             account,
             metric,
             &format!(
@@ -1130,7 +1258,7 @@ fn push_windsurf_credit_row(
         ));
     } else {
         rows.push(make_row(
-            "Windsurf",
+            "Devin",
             account,
             metric,
             "-",
@@ -1156,7 +1284,13 @@ fn pick_first_reset_value(value: &Value, paths: &[&[&str]], fallback: &str) -> S
 }
 
 fn append_kiro_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::kiro_account::list_accounts();
+    let accounts =
+        super::platform_adapter::call_kiro_with_timeout::<Vec<crate::models::kiro::KiroAccount>>(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
     for account in accounts {
         let account_name = account.email.clone();
         let status = account.status.as_deref().unwrap_or("normal");
@@ -1218,7 +1352,25 @@ fn append_kiro_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_qoder_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::qoder_account::list_accounts();
+    if !super::platform_package::is_platform_package_installed("qoder") {
+        return;
+    }
+    let accounts = match super::platform_adapter::call_qoder_with_timeout::<
+        Vec<crate::models::qoder::QoderAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    ) {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            super::logger::log_warn(&format!(
+                "[WebReport][Qoder] 读取账号列表失败，跳过报告行: {}",
+                err
+            ));
+            return;
+        }
+    };
     for account in accounts {
         let account_name = account.email.clone();
         let mut roots: Vec<&Value> = Vec::new();
@@ -1401,7 +1553,24 @@ fn pick_qoder_reset_value(roots: &[&Value]) -> String {
 }
 
 fn append_cursor_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::cursor_account::list_accounts();
+    if !super::platform_package::is_platform_package_installed("cursor") {
+        return;
+    }
+    let accounts: Vec<crate::models::cursor::CursorAccount> =
+        match super::platform_adapter::call_cursor_with_timeout(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        ) {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                super::logger::log_warn(&format!(
+                    "[WebReport][Cursor] 读取账号列表失败: {}",
+                    error
+                ));
+                Vec::new()
+            }
+        };
     for account in accounts {
         let account_name = account.email.clone();
         let status = account.status.as_deref().unwrap_or("normal");
@@ -1456,7 +1625,15 @@ fn append_cursor_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_gemini_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::gemini_account::list_accounts();
+    if !super::platform_package::is_platform_package_installed("gemini") {
+        return;
+    }
+    let accounts =
+        super::platform_adapter::call_gemini::<Vec<crate::models::gemini::GeminiAccount>>(
+            "accounts.list",
+            serde_json::json!({}),
+        )
+        .unwrap_or_default();
     for account in accounts {
         let account_name = account.email.clone();
         let status = account.status.as_deref().unwrap_or("normal");
@@ -1597,8 +1774,40 @@ fn append_codebuddy_rows(
     }
 }
 
+fn load_codebuddy_accounts() -> Vec<CodebuddyAccount> {
+    if !super::platform_package::is_platform_package_installed("codebuddy") {
+        return Vec::new();
+    }
+    super::platform_adapter::call_codebuddy_with_timeout(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default()
+}
+
+fn load_codebuddy_cn_accounts() -> Vec<CodebuddyAccount> {
+    if !super::platform_package::is_platform_package_installed("codebuddy_cn") {
+        return Vec::new();
+    }
+    super::platform_adapter::call_codebuddy_cn_with_timeout(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default()
+}
+
 fn append_workbuddy_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::workbuddy_account::list_accounts();
+    if !super::platform_package::is_platform_package_runtime_ready("workbuddy") {
+        return;
+    }
+    let accounts: Vec<WorkbuddyAccount> = super::platform_adapter::call_workbuddy_with_timeout(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default();
     for account in accounts {
         let account_name = account.email.clone();
         let status = account.status.as_deref().unwrap_or("normal");
@@ -1675,7 +1884,11 @@ fn append_workbuddy_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_zed_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::zed_account::list_accounts();
+    let accounts = super::platform_adapter::call_zed::<Vec<ZedAccount>>(
+        "accounts.list",
+        serde_json::json!({}),
+    )
+    .unwrap_or_default();
     for account in accounts {
         let account_name = zed_display_name(&account);
         let reset = format_unix_timestamp(account.billing_period_end_at);
@@ -1790,7 +2003,16 @@ fn append_zed_rows(rows: &mut Vec<ReportRow>) {
 }
 
 fn append_trae_rows(rows: &mut Vec<ReportRow>) {
-    let accounts = super::trae_account::list_accounts();
+    if !super::platform_package::is_platform_package_installed("trae") {
+        return;
+    }
+    let accounts =
+        super::platform_adapter::call_trae_with_timeout::<Vec<crate::models::trae::TraeAccount>>(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
     for account in accounts {
         let account_name = account.email.clone();
         let status = account.status.as_deref().unwrap_or("normal");
@@ -1955,9 +2177,12 @@ fn append_copilot_snapshot_rows(
     let mut count = 0usize;
 
     for (key, label) in metrics {
-        let Some(snapshot) = get_nested_value(snapshots, &[key]) else {
+        let Some(snapshot) = get_copilot_snapshot(snapshots, key) else {
             continue;
         };
+        if copilot_snapshot_without_displayable_quota(snapshot) {
+            continue;
+        }
         let Some(remaining) = get_nested_value(snapshot, &["percent_remaining"]).and_then(as_f64)
         else {
             continue;
@@ -1978,6 +2203,30 @@ fn append_copilot_snapshot_rows(
     }
 
     count
+}
+
+fn get_copilot_snapshot<'a>(snapshots: &'a Value, key: &str) -> Option<&'a Value> {
+    if matches!(key, "premium_models" | "premium_interactions") {
+        return get_nested_value(snapshots, &["premium_models"])
+            .or_else(|| get_nested_value(snapshots, &["premium_interactions"]));
+    }
+    get_nested_value(snapshots, &[key])
+}
+
+fn copilot_snapshot_without_displayable_quota(snapshot: &Value) -> bool {
+    if get_nested_value(snapshot, &["unlimited"]).and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+
+    let entitlement = get_nested_value(snapshot, &["entitlement"]).and_then(as_f64);
+    if entitlement.map(|value| value < 0.0).unwrap_or(false) {
+        return false;
+    }
+    if let Some(value) = entitlement {
+        return value <= 0.0;
+    }
+
+    get_nested_value(snapshot, &["has_quota"]).and_then(Value::as_bool) == Some(false)
 }
 
 fn pick_copilot_reset_text(reset_unix: Option<i64>, reset_iso: Option<&str>) -> String {

@@ -37,6 +37,7 @@ import {
 import { ModalErrorMessage, useModalErrorState } from '../components/ModalErrorMessage';
 import { useEscClose } from '../hooks/useEscClose';
 import { OverviewTabsHeader } from '../components/OverviewTabsHeader';
+import { useAntigravityRuntimeTarget } from '../hooks/useAntigravityRuntimeTarget';
 
 const TASKS_STORAGE_KEY = 'agtools.wakeup.tasks';
 const WAKEUP_ENABLED_KEY = 'agtools.wakeup.enabled';
@@ -83,6 +84,7 @@ type NoticeTone = 'error' | 'warning' | 'success';
 
 interface WakeupPageProps {
   onNavigate?: (page: Page) => void;
+  hideHeader?: boolean;
 }
 
 type AvailableModel = AntigravityModelOption;
@@ -115,6 +117,8 @@ interface WakeupTask {
   createdAt: number;
   lastRunAt?: number;
   schedule: ScheduleConfig;
+  execution_mode?: 'auto' | 'confirm';
+  confirm_timeout_minutes?: number;
 }
 
 interface WakeupGeneralConfig {
@@ -657,9 +661,11 @@ const getTriggerMode = (task: WakeupTask): TriggerMode => {
   return 'scheduled';
 };
 
-export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
+export function WakeupTasksPage({ onNavigate, hideHeader = false }: WakeupPageProps) {
   const { t, i18n } = useTranslation();
-  const { accounts, currentAccount, fetchAccounts, fetchCurrentAccount } = useAccountStore();
+  const antigravityRuntimeTarget = useAntigravityRuntimeTarget();
+  const { accounts, currentAccountsByTarget, fetchAccounts, fetchCurrentAccount } = useAccountStore();
+  const currentAccount = currentAccountsByTarget[antigravityRuntimeTarget] ?? null;
   const locale = i18n.language || 'zh-CN';
   const [tasks, setTasks] = useState<WakeupTask[]>(() => loadTasks(t('wakeup.defaultTaskName')));
   const [wakeupEnabled, setWakeupEnabled] = useState(() => {
@@ -711,6 +717,8 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
     'immediate',
   );
   const [formStartupDelayMinutes, setFormStartupDelayMinutes] = useState('1');
+  const [formExecutionMode, setFormExecutionMode] = useState<'auto' | 'confirm'>('auto');
+  const [formConfirmTimeoutMinutes, setFormConfirmTimeoutMinutes] = useState(5);
   const {
     message: formError,
     scrollKey: formErrorScrollKey,
@@ -1011,8 +1019,8 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
 
   useEffect(() => {
     fetchAccounts();
-    fetchCurrentAccount();
-  }, [fetchAccounts, fetchCurrentAccount]);
+    fetchCurrentAccount(antigravityRuntimeTarget);
+  }, [antigravityRuntimeTarget, fetchAccounts, fetchCurrentAccount]);
 
   useEffect(() => {
     const syncMode = () => {
@@ -1638,6 +1646,8 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
     setFormCrontabError('');
     setFormStartupDelayMode('immediate');
     setFormStartupDelayMinutes('1');
+    setFormExecutionMode('auto');
+    setFormConfirmTimeoutMinutes(5);
     setFormTimeWindowEnabled(false);
     setFormTimeWindowStart('09:00');
     setFormTimeWindowEnd('18:00');
@@ -1685,6 +1695,8 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
     setFormTimeWindowStart(schedule.timeWindowStart || '09:00');
     setFormTimeWindowEnd(schedule.timeWindowEnd || '18:00');
     setFormFallbackTimes(schedule.fallbackTimes?.length ? [...schedule.fallbackTimes] : ['07:00']);
+    setFormExecutionMode(task.execution_mode || 'auto');
+    setFormConfirmTimeoutMinutes(task.confirm_timeout_minutes || 5);
     setCustomDailyTime('');
     setCustomWeeklyTime('');
     setCustomFallbackTime('');
@@ -2111,6 +2123,8 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
         ? tasksRef.current.find((task) => task.id === editingTaskId)?.lastRunAt
         : undefined,
       schedule,
+      execution_mode: formExecutionMode,
+      confirm_timeout_minutes: formExecutionMode === 'confirm' ? formConfirmTimeoutMinutes : 5,
     };
 
     setTasks((prev) => {
@@ -2224,11 +2238,13 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
 
   return (
     <main className="main-content wakeup-page accounts-page">
-      <OverviewTabsHeader
-        active="wakeup"
-        onNavigate={onNavigate}
-        subtitle={t('wakeup.subtitle')}
-      />
+      {!hideHeader && (
+        <OverviewTabsHeader
+          active="wakeup"
+          onNavigate={onNavigate}
+          subtitle={t('wakeup.subtitle')}
+        />
+      )}
       <div className="toolbar wakeup-toolbar">
         <div className="toolbar-left">
           <div className={`wakeup-global-toggle ${wakeupEnabled ? 'is-on' : 'is-off'}`}>
@@ -2362,7 +2378,7 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
       )}
 
       {showTestModal && (
-        <div className="modal-overlay" onClick={closeTestModal}>
+        <div className="modal-overlay">
           <div
             className="modal wakeup-modal wakeup-test-modal"
             onClick={(event) => event.stopPropagation()}
@@ -2560,7 +2576,7 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
       )}
 
       {showHistoryModal && (
-        <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>
+        <div className="modal-overlay">
           <div
             className="modal wakeup-modal wakeup-history-modal"
             onClick={(event) => event.stopPropagation()}
@@ -2637,7 +2653,7 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
       )}
 
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
+        <div className="modal-overlay">
           <div className="modal modal-lg wakeup-modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <button className="btn btn-secondary icon-only" onClick={() => setShowModal(false)} title={t('common.back', '返回')} aria-label={t('common.back', '返回')}><ChevronLeft size={14} /></button>
@@ -3245,6 +3261,40 @@ export function WakeupTasksPage({ onNavigate }: WakeupPageProps) {
                       </div>
                     </div>
                   )}
+                </div>
+              )}
+
+              <div className="wakeup-form-group">
+                <label>{t('wakeup.form.executionMode', '执行模式')}</label>
+                <select
+                  className="wakeup-select"
+                  value={formExecutionMode}
+                  onChange={(event) =>
+                    setFormExecutionMode(event.target.value as 'auto' | 'confirm')
+                  }
+                >
+                  <option value="auto">{t('wakeup.form.executionModeAuto', '直接执行')}</option>
+                  <option value="confirm">{t('wakeup.form.executionModeConfirm', '需要确认')}</option>
+                </select>
+              </div>
+
+              {formExecutionMode === 'confirm' && (
+                <div className="wakeup-form-group">
+                  <label>{t('wakeup.form.confirmTimeout', '确认超时（分钟）')}</label>
+                  <div className="wakeup-input-with-unit">
+                    <input
+                      className="wakeup-input"
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={formConfirmTimeoutMinutes}
+                      onChange={(event) => {
+                        const value = Math.min(60, Math.max(1, Number(event.target.value)));
+                        setFormConfirmTimeoutMinutes(value);
+                      }}
+                    />
+                    <span>{t('settings.general.minutes')}</span>
+                  </div>
                 </div>
               )}
 

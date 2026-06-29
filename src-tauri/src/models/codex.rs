@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 fn default_token_source_mode() -> String {
     "managed".to_string()
@@ -86,8 +87,20 @@ pub struct CodexAccount {
     pub api_provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_model_catalog: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_wire_api: Option<String>,
+    #[serde(default)]
+    pub api_supports_vision: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub api_model_vision_support: HashMap<String, bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_vision_routing_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_oauth_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bound_oauth_use_local_gateway: bool,
     pub user_id: Option<String>,
     pub plan_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,9 +178,37 @@ pub struct CodexQuota {
     /// 次窗口是否存在（接口返回）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekly_window_present: Option<bool>,
+    /// 主动重置次数（rate-limit reset credits）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits_available: Option<i64>,
+    /// 主动重置明细（rate-limit reset credits）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_credits: Vec<CodexResetCredit>,
+    /// 最近一张可用主动重置次数的到期时间 (Unix timestamp)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits_next_expires_at: Option<i64>,
     /// 原始响应数据
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_data: Option<serde_json::Value>,
+}
+
+/// Codex 主动重置次数明细
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexResetCredit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_status: Option<String>,
 }
 
 /// Codex 配额错误信息
@@ -281,6 +322,18 @@ pub struct CodexAuthData {
     pub organization_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexFileImportResult {
+    pub imported: Vec<CodexAccount>,
+    pub failed: Vec<CodexFileImportFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexFileImportFailure {
+    pub email: String,
+    pub error: String,
+}
+
 impl CodexAccount {
     pub fn new(id: String, email: String, tokens: CodexTokens) -> Self {
         let now = chrono::Utc::now().timestamp();
@@ -293,7 +346,13 @@ impl CodexAccount {
             api_provider_mode: CodexApiProviderMode::OpenaiBuiltin,
             api_provider_id: None,
             api_provider_name: None,
+            api_model_catalog: Vec::new(),
+            api_wire_api: None,
+            api_supports_vision: false,
+            api_model_vision_support: HashMap::new(),
+            api_vision_routing_model: None,
             bound_oauth_account_id: None,
+            bound_oauth_use_local_gateway: false,
             user_id: None,
             plan_type: None,
             subscription_active_until: None,
@@ -331,6 +390,7 @@ impl CodexAccount {
         api_base_url: Option<String>,
         api_provider_id: Option<String>,
         api_provider_name: Option<String>,
+        api_model_catalog: Vec<String>,
     ) -> Self {
         let mut account = Self::new(
             id,
@@ -347,6 +407,11 @@ impl CodexAccount {
         account.api_base_url = api_base_url;
         account.api_provider_id = api_provider_id;
         account.api_provider_name = api_provider_name;
+        account.api_model_catalog = api_model_catalog;
+        account.api_wire_api = None;
+        account.api_supports_vision = false;
+        account.api_model_vision_support = HashMap::new();
+        account.api_vision_routing_model = None;
         account.plan_type = Some("API_KEY".to_string());
         account
     }
@@ -358,4 +423,189 @@ impl CodexAccount {
     pub fn update_last_used(&mut self) {
         self.last_used = chrono::Utc::now().timestamp();
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInstanceThreadSyncItem {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub added_thread_count: usize,
+    pub updated_thread_count: usize,
+    pub backup_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInstanceThreadSyncSummary {
+    pub instance_count: usize,
+    pub thread_universe_count: usize,
+    pub mutated_instance_count: usize,
+    pub total_synced_thread_count: usize,
+    pub total_added_thread_count: usize,
+    pub total_updated_thread_count: usize,
+    pub items: Vec<CodexInstanceThreadSyncItem>,
+    pub backup_dirs: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInstanceTargetThreadSyncSummary {
+    pub requested_session_count: usize,
+    pub target_instance_id: String,
+    pub target_instance_name: String,
+    pub synced_session_count: usize,
+    pub skipped_existing_count: usize,
+    pub missing_session_count: usize,
+    pub backup_dir: Option<String>,
+    pub running: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSessionVisibilityRepairMode {
+    Quick,
+    Deep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSessionVisibilityRepairProviderSource {
+    Config,
+    Rollout,
+    Sqlite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionVisibilityRepairProviderOption {
+    pub id: String,
+    pub sources: Vec<CodexSessionVisibilityRepairProviderSource>,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionVisibilityRepairProviderList {
+    pub default_provider: String,
+    pub providers: Vec<CodexSessionVisibilityRepairProviderOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionVisibilityRepairInstanceOption {
+    pub id: String,
+    pub name: String,
+    pub user_data_dir: String,
+    pub current_provider: String,
+    pub is_default: bool,
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionVisibilityRepairInstanceList {
+    pub default_instance_id: String,
+    pub instances: Vec<CodexSessionVisibilityRepairInstanceOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionVisibilityRepairItem {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub target_provider: String,
+    pub changed_rollout_file_count: usize,
+    pub updated_sqlite_row_count: usize,
+    pub updated_sqlite_timestamp_row_count: usize,
+    pub added_session_index_entry_count: usize,
+    pub updated_session_index_entry_count: usize,
+    pub skipped_sqlite_file: bool,
+    pub metadata_rebuild_failed: bool,
+    pub backup_dir: Option<String>,
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionVisibilityRepairSummary {
+    pub instance_count: usize,
+    pub mutated_instance_count: usize,
+    pub changed_rollout_file_count: usize,
+    pub updated_sqlite_row_count: usize,
+    pub updated_sqlite_timestamp_row_count: usize,
+    pub added_session_index_entry_count: usize,
+    pub updated_session_index_entry_count: usize,
+    pub skipped_sqlite_file_count: usize,
+    pub metadata_rebuild_failed_count: usize,
+    pub items: Vec<CodexSessionVisibilityRepairItem>,
+    pub backup_dirs: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionLocation {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionRecord {
+    pub session_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub updated_at: Option<i64>,
+    pub location_count: usize,
+    pub locations: Vec<CodexSessionLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionTokenStats {
+    pub session_id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionTrashSummary {
+    pub requested_session_count: usize,
+    pub trashed_session_count: usize,
+    pub trashed_instance_count: usize,
+    pub trash_dirs: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTrashedSessionLocation {
+    pub instance_id: String,
+    pub instance_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTrashedSessionRecord {
+    pub session_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub deleted_at: Option<i64>,
+    pub location_count: usize,
+    pub locations: Vec<CodexTrashedSessionLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionRestoreSummary {
+    pub requested_session_count: usize,
+    pub restored_session_count: usize,
+    pub restored_instance_count: usize,
+    pub message: String,
 }

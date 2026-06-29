@@ -17,6 +17,7 @@ import { showFloatingCardWindow } from '../services/floatingCardService';
 import { usePlatformRuntimeSupport } from '../hooks/usePlatformRuntimeSupport';
 import { usePlatformLayoutStore } from '../stores/usePlatformLayoutStore';
 import { SideNavLayoutMode, useSideNavLayoutStore } from '../stores/useSideNavLayoutStore';
+import { useSponsorStore } from '../stores/useSponsorStore';
 import { UnlockFireworksOverlay } from '../components/UnlockFireworksOverlay';
 import {
   AutoSwitchAccountScopeSelector,
@@ -44,9 +45,45 @@ import {
   type CurrentAccountRefreshPlatform,
   loadCurrentAccountRefreshMinutesMap,
   saveCurrentAccountRefreshMinutesMap,
+  loadAccountRefreshOverrides,
+  setAccountRefreshMinutes,
+  removeAccountRefreshOverride,
+  type AccountRefreshOverrides,
 } from '../utils/currentAccountRefresh';
+import { useGitHubCopilotAccountStore } from '../stores/useGitHubCopilotAccountStore';
+import { useWindsurfAccountStore } from '../stores/useWindsurfAccountStore';
+import { useKiroAccountStore } from '../stores/useKiroAccountStore';
+import { useCursorAccountStore } from '../stores/useCursorAccountStore';
+import { useGeminiAccountStore } from '../stores/useGeminiAccountStore';
+import { useClaudeAccountStore } from '../stores/useClaudeAccountStore';
+import { useCodebuddyAccountStore } from '../stores/useCodebuddyAccountStore';
+import { useCodebuddyCnAccountStore } from '../stores/useCodebuddyCnAccountStore';
+import { useWorkbuddyAccountStore } from '../stores/useWorkbuddyAccountStore';
+import { useQoderAccountStore } from '../stores/useQoderAccountStore';
+import { useTraeAccountStore } from '../stores/useTraeAccountStore';
+import { useZedAccountStore } from '../stores/useZedAccountStore';
+import { usePlatformPackageStore } from '../stores/usePlatformPackageStore';
+import { getGitHubCopilotAccountDisplayEmail } from '../types/githubCopilot';
+import { getWindsurfAccountDisplayEmail } from '../types/windsurf';
+import { getKiroAccountDisplayEmail } from '../types/kiro';
+import { getCursorAccountDisplayEmail } from '../types/cursor';
+import { getGeminiAccountDisplayEmail } from '../types/gemini';
+import { getClaudeAccountDisplayEmail } from '../types/claude';
+import { getCodebuddyAccountDisplayEmail } from '../types/codebuddy';
+import { getWorkbuddyAccountDisplayEmail } from '../types/workbuddy';
+import { getQoderAccountDisplayEmail } from '../types/qoder';
+import { getTraeAccountDisplayEmail } from '../types/trae';
+import { getZedAccountDisplayEmail } from '../types/zed';
 import { ALL_PLATFORM_IDS, PlatformId } from '../types/platform';
+import {
+  buildStartupPageOptions,
+  DEFAULT_STARTUP_PAGE,
+  LAST_CLOSED_STARTUP_PAGE,
+  normalizeStartupPageValue,
+  type StartupPageValue,
+} from '../utils/startupPage';
 import { SettingsAccountTransferSection } from '../components/SettingsAccountTransferSection';
+import { SettingsWebdavSyncSection } from '../components/SettingsWebdavSyncSection';
 import { useEscClose } from '../hooks/useEscClose';
 import './settings/Settings.css';
 import { 
@@ -80,6 +117,9 @@ interface GeneralConfig {
   ui_scale: number;
   auto_refresh_minutes: number;
   codex_auto_refresh_minutes: number;
+  claude_auto_refresh_minutes: number;
+  codex_sync_wsl: boolean;
+  codex_wsl_config_dir: string;
   ghcp_auto_refresh_minutes: number;
   windsurf_auto_refresh_minutes: number;
   kiro_auto_refresh_minutes: number;
@@ -90,12 +130,16 @@ interface GeneralConfig {
   minimize_behavior?: 'dock_and_tray' | 'tray_only';
   hide_dock_icon?: boolean;
   tray_icon_style?: 'template' | 'color';
+  startup_page?: string;
   floating_card_show_on_startup?: boolean;
+  startup_minimized?: boolean;
   floating_card_always_on_top?: boolean;
   app_auto_launch_enabled?: boolean;
   opencode_app_path: string;
   antigravity_app_path: string;
   codex_app_path: string;
+  claude_app_path: string;
+  claude_app_scan_roots: string;
   codex_specified_app_path: string;
   vscode_app_path: string;
   windsurf_app_path: string;
@@ -131,6 +175,7 @@ interface GeneralConfig {
   codex_launch_on_switch: boolean;
   codex_restart_specified_app_on_switch: boolean;
   codex_local_access_entry_visible: boolean;
+  top_right_ad_visible?: boolean;
   antigravity_dual_switch_no_restart_enabled: boolean;
   auto_switch_enabled: boolean;
   auto_switch_threshold: number;
@@ -147,6 +192,8 @@ interface GeneralConfig {
   quota_alert_threshold: number;
   codex_quota_alert_enabled: boolean;
   codex_quota_alert_threshold: number;
+  claude_quota_alert_enabled: boolean;
+  claude_quota_alert_threshold: number;
   ghcp_quota_alert_enabled: boolean;
   ghcp_quota_alert_threshold: number;
   windsurf_quota_alert_enabled: boolean;
@@ -162,6 +209,7 @@ interface GeneralConfig {
 type AppPathTarget =
   | 'antigravity'
   | 'codex'
+  | 'claude'
   | 'vscode'
   | 'opencode'
   | 'windsurf'
@@ -173,6 +221,14 @@ type AppPathTarget =
   | 'trae'
   | 'workbuddy'
   | 'zed';
+
+type ClaudeDesktopLaunchCandidate = {
+  target_type: string;
+  label: string;
+  target: string;
+  source: string;
+  supports_multi_instance: boolean;
+};
 const REFRESH_PRESET_VALUES = ['-1', '2', '5', '10', '15'];
 const CURRENT_ACCOUNT_REFRESH_PRESET_VALUES = ['1', '2', '5', '10', '15'];
 const THRESHOLD_PRESET_VALUES = ['0', '20', '40', '60'];
@@ -186,17 +242,18 @@ const FALLBACK_PLATFORM_SETTINGS_ORDER: Record<PlatformId, number> = {
   antigravity: 0,
   antigravity_ide: 1,
   codex: 2,
-  'github-copilot': 3,
-  windsurf: 4,
-  kiro: 5,
-  cursor: 6,
-  gemini: 7,
-  codebuddy: 8,
-  codebuddy_cn: 9,
-  qoder: 10,
-  trae: 11,
-  workbuddy: 12,
-  zed: 13,
+  claude_manager: 3,
+  'github-copilot': 4,
+  windsurf: 5,
+  kiro: 6,
+  cursor: 7,
+  gemini: 8,
+  codebuddy: 9,
+  codebuddy_cn: 10,
+  qoder: 11,
+  trae: 12,
+  workbuddy: 13,
+  zed: 14,
 };
 type UpdateCheckSource = 'auto' | 'manual';
 type UpdateCheckFinishedDetail = {
@@ -257,7 +314,7 @@ export function SettingsPage() {
   const isLinux = usePlatformRuntimeSupport('linux-only');
   const sideNavLayoutMode = useSideNavLayoutStore((state) => state.mode);
   const setSideNavLayoutMode = useSideNavLayoutStore((state) => state.setMode);
-  const [activeTab, setActiveTab] = useState<'general' | 'network' | 'about'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'network' | 'data' | 'about'>('general');
   const [availableTerminals, setAvailableTerminals] = useState<string[]>(['system']);
 
   useEffect(() => {
@@ -298,6 +355,10 @@ export function SettingsPage() {
   }, [isMacOS, isWindows, isLinux, availableTerminals, t]);
 
   const orderedPlatformIds = usePlatformLayoutStore((state) => state.orderedPlatformIds);
+  const sidebarEntryIds = usePlatformLayoutStore((state) => state.sidebarEntryIds);
+  const platformGroups = usePlatformLayoutStore((state) => state.platformGroups);
+  const apiRelaySidebarVisible = usePlatformLayoutStore((state) => state.apiRelaySidebarVisible);
+  const sponsorEntryVisible = useSponsorStore((state) => Boolean(state.state.sponsorModule));
   const platformSettingsOrder = useMemo<Record<PlatformId, number>>(() => {
     const next: Record<PlatformId, number> = { ...FALLBACK_PLATFORM_SETTINGS_ORDER };
     let order = 0;
@@ -308,6 +369,23 @@ export function SettingsPage() {
     }
     return next;
   }, [orderedPlatformIds]);
+
+  const startupPageOptions = useMemo(
+    () => buildStartupPageOptions(
+      {
+        sidebarEntryIds,
+        platformGroups,
+        apiRelayVisible: sponsorEntryVisible && apiRelaySidebarVisible,
+      },
+      t,
+    ),
+    [apiRelaySidebarVisible, platformGroups, sidebarEntryIds, sponsorEntryVisible, t],
+  );
+
+  const startupPageOptionValues = useMemo(
+    () => new Set(startupPageOptions.map((option) => option.value)),
+    [startupPageOptions],
+  );
 
   const languageOptions = [
     { value: 'zh-cn', label: '简体中文' },
@@ -336,6 +414,9 @@ export function SettingsPage() {
   const [uiScale, setUiScale] = useState('1');
   const [autoRefresh, setAutoRefresh] = useState('5');
   const [codexAutoRefresh, setCodexAutoRefresh] = useState('10');
+  const [claudeAutoRefresh, setClaudeAutoRefresh] = useState('10');
+  const [codexSyncWsl, setCodexSyncWsl] = useState(false);
+  const [codexWslConfigDir, setCodexWslConfigDir] = useState('');
   const [ghcpAutoRefresh, setGhcpAutoRefresh] = useState('10');
   const [windsurfAutoRefresh, setWindsurfAutoRefresh] = useState('10');
   const [kiroAutoRefresh, setKiroAutoRefresh] = useState('10');
@@ -346,12 +427,16 @@ export function SettingsPage() {
   const [minimizeBehavior, setMinimizeBehavior] = useState<'dock_and_tray' | 'tray_only'>('dock_and_tray');
   const [hideDockIcon, setHideDockIcon] = useState(false);
   const [trayIconStyle, setTrayIconStyle] = useState<'template' | 'color'>('template');
+  const [startupPage, setStartupPage] = useState<StartupPageValue>(DEFAULT_STARTUP_PAGE);
   const [floatingCardShowOnStartup, setFloatingCardShowOnStartup] = useState(false);
+  const [startupMinimized, setStartupMinimized] = useState(false);
   const [floatingCardAlwaysOnTop, setFloatingCardAlwaysOnTop] = useState(false);
   const [appAutoLaunchEnabled, setAppAutoLaunchEnabled] = useState(false);
   const [opencodeAppPath, setOpencodeAppPath] = useState('');
   const [antigravityAppPath, setAntigravityAppPath] = useState('');
   const [codexAppPath, setCodexAppPath] = useState('');
+  const [claudeAppPath, setClaudeAppPath] = useState('');
+  const [claudeAppScanRoots, setClaudeAppScanRoots] = useState('');
   const [codexSpecifiedAppPath, setCodexSpecifiedAppPath] = useState('');
   const [vscodeAppPath, setVscodeAppPath] = useState('');
   const [windsurfAppPath, setWindsurfAppPath] = useState('');
@@ -377,6 +462,12 @@ export function SettingsPage() {
   const [currentAccountRefreshCustomMode, setCurrentAccountRefreshCustomMode] = useState<
     Record<CurrentAccountRefreshPlatform, boolean>
   >(() => buildDefaultCurrentAccountRefreshCustomModeMap());
+  const [accountOverrides, setAccountOverrides] = useState<AccountRefreshOverrides>(
+    loadAccountRefreshOverrides(),
+  );
+  const [accountLevelRefreshCustomMode, setAccountLevelRefreshCustomMode] = useState<
+    Record<string, boolean>
+  >({});
   const [codebuddyQuotaAlertEnabled, setCodebuddyQuotaAlertEnabled] = useState(false);
   const [codebuddyQuotaAlertThreshold, setCodebuddyQuotaAlertThreshold] = useState('20');
   const [codebuddyCnQuotaAlertEnabled, setCodebuddyCnQuotaAlertEnabled] = useState(false);
@@ -402,12 +493,14 @@ export function SettingsPage() {
   const [codebuddyCnQuotaAlertThresholdCustomMode, setCodebuddyCnQuotaAlertThresholdCustomMode] = useState(false);
   const [workbuddyQuotaAlertThresholdCustomMode, setWorkbuddyQuotaAlertThresholdCustomMode] = useState(false);
   const [appPathResetDetectingTargets, setAppPathResetDetectingTargets] = useState<Set<AppPathTarget>>(new Set());
+  const [claudeLaunchCandidates, setClaudeLaunchCandidates] = useState<ClaudeDesktopLaunchCandidate[]>([]);
   const [opencodeSyncOnSwitch, setOpencodeSyncOnSwitch] = useState(false);
   const [opencodeAuthOverwriteOnSwitch, setOpencodeAuthOverwriteOnSwitch] = useState(false);
   const [openclawAuthOverwriteOnSwitch, setOpenclawAuthOverwriteOnSwitch] = useState(false);
   const [codexLaunchOnSwitch, setCodexLaunchOnSwitch] = useState(true);
   const [codexRestartSpecifiedAppOnSwitch, setCodexRestartSpecifiedAppOnSwitch] = useState(false);
   const [codexLocalAccessEntryVisible, setCodexLocalAccessEntryVisible] = useState(true);
+  const [topRightAdVisible, setTopRightAdVisible] = useState(true);
   const [antigravityDualSwitchNoRestartEnabled, setAntigravityDualSwitchNoRestartEnabled] = useState(false);
   const [autoSwitchEnabled, setAutoSwitchEnabled] = useState(false);
   const [autoSwitchThreshold, setAutoSwitchThreshold] = useState('20');
@@ -426,6 +519,8 @@ export function SettingsPage() {
   const [quotaAlertThreshold, setQuotaAlertThreshold] = useState('20');
   const [codexQuotaAlertEnabled, setCodexQuotaAlertEnabled] = useState(false);
   const [codexQuotaAlertThreshold, setCodexQuotaAlertThreshold] = useState('20');
+  const [claudeQuotaAlertEnabled, setClaudeQuotaAlertEnabled] = useState(false);
+  const [claudeQuotaAlertThreshold, setClaudeQuotaAlertThreshold] = useState('20');
   const [ghcpQuotaAlertEnabled, setGhcpQuotaAlertEnabled] = useState(false);
   const [ghcpQuotaAlertThreshold, setGhcpQuotaAlertThreshold] = useState('20');
   const [windsurfQuotaAlertEnabled, setWindsurfQuotaAlertEnabled] = useState(false);
@@ -438,6 +533,7 @@ export function SettingsPage() {
   const [geminiQuotaAlertThreshold, setGeminiQuotaAlertThreshold] = useState('20');
   const [autoRefreshCustomMode, setAutoRefreshCustomMode] = useState(false);
   const [codexAutoRefreshCustomMode, setCodexAutoRefreshCustomMode] = useState(false);
+  const [claudeAutoRefreshCustomMode, setClaudeAutoRefreshCustomMode] = useState(false);
   const [ghcpAutoRefreshCustomMode, setGhcpAutoRefreshCustomMode] = useState(false);
   const [windsurfAutoRefreshCustomMode, setWindsurfAutoRefreshCustomMode] = useState(false);
   const [kiroAutoRefreshCustomMode, setKiroAutoRefreshCustomMode] = useState(false);
@@ -447,6 +543,7 @@ export function SettingsPage() {
   const [autoSwitchCreditsThresholdCustomMode, setAutoSwitchCreditsThresholdCustomMode] = useState(false);
   const [quotaAlertThresholdCustomMode, setQuotaAlertThresholdCustomMode] = useState(false);
   const [codexQuotaAlertThresholdCustomMode, setCodexQuotaAlertThresholdCustomMode] = useState(false);
+  const [claudeQuotaAlertThresholdCustomMode, setClaudeQuotaAlertThresholdCustomMode] = useState(false);
   const [ghcpQuotaAlertThresholdCustomMode, setGhcpQuotaAlertThresholdCustomMode] = useState(false);
   const [windsurfQuotaAlertThresholdCustomMode, setWindsurfQuotaAlertThresholdCustomMode] = useState(false);
   const [kiroQuotaAlertThresholdCustomMode, setKiroQuotaAlertThresholdCustomMode] = useState(false);
@@ -483,6 +580,7 @@ export function SettingsPage() {
   const [antigravityAccountGroups, setAntigravityAccountGroups] = useState<AccountGroup[]>([]);
   const [codexAccounts, setCodexAccounts] = useState<CodexAccount[]>([]);
   const [codexGroups, setCodexGroups] = useState<CodexAccountGroup[]>([]);
+  const codexRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('codex'));
 
   const antigravityScopeTypeOptions = useMemo(
     () => buildAccountTierFilterOptions(t, buildAccountTierCounts(antigravityAccounts, {})),
@@ -510,13 +608,15 @@ export function SettingsPage() {
   );
   const codexScopeAccounts = useMemo<AutoSwitchScopeAccount[]>(
     () =>
-      codexAccounts.map((account) => ({
-        id: account.id,
-        label: account.email,
-        searchableText: account.email,
-        tags: account.tags || [],
-      })),
-    [codexAccounts],
+      codexRuntimeReady
+        ? codexAccounts.map((account) => ({
+            id: account.id,
+            label: account.email,
+            searchableText: account.email,
+            tags: account.tags || [],
+          }))
+        : [],
+    [codexAccounts, codexRuntimeReady],
   );
 
   useEffect(() => {
@@ -527,8 +627,8 @@ export function SettingsPage() {
           await Promise.all([
             accountService.listAccounts(),
             getAccountGroups(),
-            codexService.listCodexAccounts(),
-            getCodexAccountGroups(),
+            codexRuntimeReady ? codexService.listCodexAccounts() : Promise.resolve([]),
+            codexRuntimeReady ? getCodexAccountGroups() : Promise.resolve([]),
           ]);
         if (!mounted) return;
         setAntigravityAccounts(nextAntigravityAccounts || []);
@@ -552,7 +652,7 @@ export function SettingsPage() {
     return () => {
       mounted = false;
     };
-  }, [activeTab]);
+  }, [activeTab, codexRuntimeReady]);
 
   useEffect(() => {
     getVersion().then(ver => setAppVersion(`v${ver}`));
@@ -695,6 +795,15 @@ export function SettingsPage() {
   }, [generalLoaded, uiScale]);
 
   useEffect(() => {
+    if (!generalLoaded || startupPage === LAST_CLOSED_STARTUP_PAGE) {
+      return;
+    }
+    if (!startupPageOptionValues.has(startupPage)) {
+      setStartupPage(DEFAULT_STARTUP_PAGE);
+    }
+  }, [generalLoaded, startupPage, startupPageOptionValues]);
+
+  useEffect(() => {
     if (!generalLoaded) {
       return;
     }
@@ -706,6 +815,7 @@ export function SettingsPage() {
     if (
       !autoRefresh.trim() ||
       !codexAutoRefresh.trim() ||
+      !claudeAutoRefresh.trim() ||
       !ghcpAutoRefresh.trim() ||
       !windsurfAutoRefresh.trim() ||
       !kiroAutoRefresh.trim() ||
@@ -723,6 +833,7 @@ export function SettingsPage() {
 
     const autoRefreshNum = parseInt(autoRefresh, 10) || -1;
     const codexAutoRefreshNum = parseInt(codexAutoRefresh, 10) || -1;
+    const claudeAutoRefreshNum = parseInt(claudeAutoRefresh, 10) || -1;
     const ghcpAutoRefreshNum = parseInt(ghcpAutoRefresh, 10) || -1;
     const windsurfAutoRefreshNum = parseInt(windsurfAutoRefresh, 10) || -1;
     const kiroAutoRefreshNum = parseInt(kiroAutoRefresh, 10) || -1;
@@ -742,6 +853,7 @@ export function SettingsPage() {
     const parsedAutoSwitchCreditsThreshold = Number.parseInt(autoSwitchCreditsThreshold, 10);
     const parsedQuotaAlertThreshold = Number.parseInt(quotaAlertThreshold, 10);
     const parsedCodexQuotaAlertThreshold = Number.parseInt(codexQuotaAlertThreshold, 10);
+    const parsedClaudeQuotaAlertThreshold = Number.parseInt(claudeQuotaAlertThreshold, 10);
     const parsedGhcpQuotaAlertThreshold = Number.parseInt(ghcpQuotaAlertThreshold, 10);
     const parsedWindsurfQuotaAlertThreshold = Number.parseInt(windsurfQuotaAlertThreshold, 10);
     const parsedKiroQuotaAlertThreshold = Number.parseInt(kiroQuotaAlertThreshold, 10);
@@ -767,6 +879,9 @@ export function SettingsPage() {
           uiScale: normalizedUiScale,
           autoRefreshMinutes: autoRefreshNum,
           codexAutoRefreshMinutes: codexAutoRefreshNum,
+          claudeAutoRefreshMinutes: claudeAutoRefreshNum,
+          codexSyncWsl,
+          codexWslConfigDir,
           ghcpAutoRefreshMinutes: ghcpAutoRefreshNum,
           windsurfAutoRefreshMinutes: windsurfAutoRefreshNum,
           kiroAutoRefreshMinutes: kiroAutoRefreshNum,
@@ -783,12 +898,16 @@ export function SettingsPage() {
           minimizeBehavior,
           hideDockIcon,
           trayIconStyle: isMacOS ? trayIconStyle : undefined,
+          startupPage,
           floatingCardShowOnStartup,
+          startupMinimized,
           floatingCardAlwaysOnTop,
           appAutoLaunchEnabled,
           opencodeAppPath,
           antigravityAppPath,
           codexAppPath,
+          claudeAppPath,
+          claudeAppScanRoots,
           codexSpecifiedAppPath,
           vscodeAppPath,
           windsurfAppPath,
@@ -806,6 +925,7 @@ export function SettingsPage() {
           codexLaunchOnSwitch,
           codexRestartSpecifiedAppOnSwitch,
           codexLocalAccessEntryVisible,
+          topRightAdVisible,
           antigravityDualSwitchNoRestartEnabled,
           autoSwitchEnabled,
           autoSwitchThreshold: Number.isNaN(parsedAutoSwitchThreshold) ? 20 : parsedAutoSwitchThreshold,
@@ -823,6 +943,10 @@ export function SettingsPage() {
           codexQuotaAlertThreshold: Number.isNaN(parsedCodexQuotaAlertThreshold)
             ? 20
             : parsedCodexQuotaAlertThreshold,
+          claudeQuotaAlertEnabled,
+          claudeQuotaAlertThreshold: Number.isNaN(parsedClaudeQuotaAlertThreshold)
+            ? 20
+            : parsedClaudeQuotaAlertThreshold,
           ghcpQuotaAlertEnabled,
           ghcpQuotaAlertThreshold: Number.isNaN(parsedGhcpQuotaAlertThreshold)
             ? 20
@@ -883,6 +1007,9 @@ export function SettingsPage() {
   }, [
     autoRefresh,
     codexAutoRefresh,
+    claudeAutoRefresh,
+    codexSyncWsl,
+    codexWslConfigDir,
     ghcpAutoRefresh,
     windsurfAutoRefresh,
     kiroAutoRefresh,
@@ -896,8 +1023,10 @@ export function SettingsPage() {
     minimizeBehavior,
     hideDockIcon,
     trayIconStyle,
+    startupPage,
     isMacOS,
     floatingCardShowOnStartup,
+    startupMinimized,
     floatingCardAlwaysOnTop,
     appAutoLaunchEnabled,
     generalLoaded,
@@ -908,6 +1037,8 @@ export function SettingsPage() {
     opencodeAppPath,
     antigravityAppPath,
     codexAppPath,
+    claudeAppPath,
+    claudeAppScanRoots,
     codexSpecifiedAppPath,
     vscodeAppPath,
     windsurfAppPath,
@@ -925,6 +1056,7 @@ export function SettingsPage() {
     codexLaunchOnSwitch,
     codexRestartSpecifiedAppOnSwitch,
     codexLocalAccessEntryVisible,
+    topRightAdVisible,
     antigravityDualSwitchNoRestartEnabled,
     autoSwitchEnabled,
     autoSwitchThreshold,
@@ -938,6 +1070,8 @@ export function SettingsPage() {
     quotaAlertThreshold,
     codexQuotaAlertEnabled,
     codexQuotaAlertThreshold,
+    claudeQuotaAlertEnabled,
+    claudeQuotaAlertThreshold,
     ghcpQuotaAlertEnabled,
     ghcpQuotaAlertThreshold,
     windsurfQuotaAlertEnabled,
@@ -1177,6 +1311,9 @@ export function SettingsPage() {
       setUiScale(String(config.ui_scale ?? 1));
       setAutoRefresh(String(config.auto_refresh_minutes));
       setCodexAutoRefresh(String(config.codex_auto_refresh_minutes ?? 10));
+      setClaudeAutoRefresh(String(config.claude_auto_refresh_minutes ?? 10));
+      setCodexSyncWsl(Boolean(config.codex_sync_wsl ?? false));
+      setCodexWslConfigDir(config.codex_wsl_config_dir || '');
       setGhcpAutoRefresh(String(config.ghcp_auto_refresh_minutes ?? 10));
       setWindsurfAutoRefresh(String(config.windsurf_auto_refresh_minutes ?? 10));
       setKiroAutoRefresh(String(config.kiro_auto_refresh_minutes ?? 10));
@@ -1187,12 +1324,17 @@ export function SettingsPage() {
       setMinimizeBehavior(config.minimize_behavior || 'dock_and_tray');
       setHideDockIcon(Boolean(config.hide_dock_icon));
       setTrayIconStyle(config.tray_icon_style === 'color' ? 'color' : 'template');
+      setStartupPage(normalizeStartupPageValue(config.startup_page));
       setFloatingCardShowOnStartup(config.floating_card_show_on_startup ?? false);
+      setStartupMinimized(config.startup_minimized ?? false);
       setFloatingCardAlwaysOnTop(config.floating_card_always_on_top ?? false);
       setAppAutoLaunchEnabled(config.app_auto_launch_enabled ?? false);
       setOpencodeAppPath(config.opencode_app_path || '');
       setAntigravityAppPath(config.antigravity_app_path || '');
       setCodexAppPath(config.codex_app_path || '');
+      setClaudeAppPath(config.claude_app_path || '');
+      setClaudeAppScanRoots(config.claude_app_scan_roots || '');
+      setClaudeLaunchCandidates([]);
       setCodexSpecifiedAppPath(config.codex_specified_app_path || '');
       setVscodeAppPath(config.vscode_app_path || '');
       setWindsurfAppPath(config.windsurf_app_path || '');
@@ -1233,6 +1375,7 @@ export function SettingsPage() {
         config.codex_restart_specified_app_on_switch ?? false,
       );
       setCodexLocalAccessEntryVisible(config.codex_local_access_entry_visible ?? true);
+      setTopRightAdVisible(config.top_right_ad_visible ?? true);
       setAntigravityDualSwitchNoRestartEnabled(
         config.antigravity_dual_switch_no_restart_enabled ?? false
       );
@@ -1253,6 +1396,8 @@ export function SettingsPage() {
       setQuotaAlertThreshold(String(config.quota_alert_threshold ?? 20));
       setCodexQuotaAlertEnabled(config.codex_quota_alert_enabled ?? false);
       setCodexQuotaAlertThreshold(String(config.codex_quota_alert_threshold ?? 20));
+      setClaudeQuotaAlertEnabled(config.claude_quota_alert_enabled ?? false);
+      setClaudeQuotaAlertThreshold(String(config.claude_quota_alert_threshold ?? 20));
       setGhcpQuotaAlertEnabled(config.ghcp_quota_alert_enabled ?? false);
       setGhcpQuotaAlertThreshold(String(config.ghcp_quota_alert_threshold ?? 20));
       setWindsurfQuotaAlertEnabled(config.windsurf_quota_alert_enabled ?? false);
@@ -1265,6 +1410,7 @@ export function SettingsPage() {
       setGeminiQuotaAlertThreshold(String(config.gemini_quota_alert_threshold ?? 20));
       setAutoRefreshCustomMode(false);
       setCodexAutoRefreshCustomMode(false);
+      setClaudeAutoRefreshCustomMode(false);
       setGhcpAutoRefreshCustomMode(false);
       setWindsurfAutoRefreshCustomMode(false);
       setKiroAutoRefreshCustomMode(false);
@@ -1280,6 +1426,7 @@ export function SettingsPage() {
       setAutoSwitchCreditsThresholdCustomMode(false);
       setQuotaAlertThresholdCustomMode(false);
       setCodexQuotaAlertThresholdCustomMode(false);
+      setClaudeQuotaAlertThresholdCustomMode(false);
       setGhcpQuotaAlertThresholdCustomMode(false);
       setWindsurfQuotaAlertThresholdCustomMode(false);
       setKiroQuotaAlertThresholdCustomMode(false);
@@ -1377,6 +1524,8 @@ export function SettingsPage() {
       setAntigravityAppPath(path);
     } else if (target === 'codex') {
       setCodexAppPath(path);
+    } else if (target === 'claude') {
+      setClaudeAppPath(path);
     } else if (target === 'vscode') {
       setVscodeAppPath(path);
     } else if (target === 'windsurf') {
@@ -1436,6 +1585,9 @@ export function SettingsPage() {
     if (target === 'opencode') {
       return t('settings.general.opencodePathReset', '重置默认');
     }
+    if (target === 'claude') {
+      return t('appPath.missing.scanApps', '扫描应用');
+    }
     return t('settings.general.codexPathReset', '重置默认');
   };
 
@@ -1453,6 +1605,26 @@ export function SettingsPage() {
     } catch (err) {
       console.error('选择启动路径失败:', err);
     }
+  };
+
+  const handlePickClaudeScanRoot = async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: true,
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (!path) return;
+      setClaudeAppScanRoots(path);
+      setClaudeLaunchCandidates([]);
+    } catch (err) {
+      console.error('选择 Claude 扫描范围失败:', err);
+    }
+  };
+
+  const handleClearClaudeScanRoot = () => {
+    setClaudeAppScanRoots('');
+    setClaudeLaunchCandidates([]);
   };
 
   const handlePickCodexSpecifiedAppPath = async () => {
@@ -1477,6 +1649,22 @@ export function SettingsPage() {
       return next;
     });
     try {
+      if (target === 'claude') {
+        const candidates = await invoke<ClaudeDesktopLaunchCandidate[]>(
+          'scan_claude_desktop_launch_targets',
+          {
+            scanRoots: claudeAppScanRoots.trim() || null,
+          },
+        );
+        setClaudeLaunchCandidates(candidates);
+        if (candidates.length === 0) {
+          alert(t(
+            'settings.general.claudeLaunchScanEmpty',
+            '未扫描到 Claude Desktop，请手动选择 Claude.exe 或调整扫描范围。',
+          ));
+        }
+        return;
+      }
       const detected = await invoke<string | null>('detect_app_path', { app: target, force: true });
       setAppPathForTarget(target, detected || '');
     } catch (err) {
@@ -1489,6 +1677,10 @@ export function SettingsPage() {
         return next;
       });
     }
+  };
+
+  const handleSelectClaudeLaunchCandidate = (candidate: ClaudeDesktopLaunchCandidate) => {
+    setClaudeAppPath(candidate.target);
   };
 
   const sanitizeNumberInput = (value: string) => value.replace(/[^\d]/g, '');
@@ -1531,6 +1723,8 @@ export function SettingsPage() {
         return parseRefresh(autoRefresh) > 0;
       case 'codex':
         return parseRefresh(codexAutoRefresh) > 0;
+      case 'claude':
+        return parseRefresh(claudeAutoRefresh) > 0;
       case 'ghcp':
         return parseRefresh(ghcpAutoRefresh) > 0;
       case 'windsurf':
@@ -1652,8 +1846,415 @@ export function SettingsPage() {
     );
   };
 
+  const getAccountsForPlatform = (
+    platform: CurrentAccountRefreshPlatform,
+  ): Array<{ id: string; email: string }> => {
+    const getProviderAccounts = <T extends { id: string; email?: string | null }>(
+      store: { getState: () => { accounts: T[] } },
+      getDisplayEmail: (account: T) => string,
+    ): Array<{ id: string; email: string }> =>
+      store.getState().accounts.map((a) => ({
+        id: a.id,
+        email: a.email ?? getDisplayEmail(a),
+      }));
+
+    switch (platform) {
+      case 'antigravity':
+        return antigravityAccounts.map((a) => ({ id: a.id, email: a.email }));
+      case 'codex':
+        if (!codexRuntimeReady) return [];
+        return codexAccounts.map((a) => ({ id: a.id, email: a.email }));
+      case 'claude':
+        if (!usePlatformPackageStore.getState().canOpenPlatform('claude_manager')) return [];
+        return getProviderAccounts(useClaudeAccountStore, getClaudeAccountDisplayEmail);
+      case 'ghcp':
+        return getProviderAccounts(useGitHubCopilotAccountStore, getGitHubCopilotAccountDisplayEmail);
+      case 'windsurf':
+        return getProviderAccounts(useWindsurfAccountStore, getWindsurfAccountDisplayEmail);
+      case 'kiro':
+        return getProviderAccounts(useKiroAccountStore, getKiroAccountDisplayEmail);
+      case 'cursor':
+        return getProviderAccounts(useCursorAccountStore, getCursorAccountDisplayEmail);
+      case 'gemini':
+        return getProviderAccounts(useGeminiAccountStore, getGeminiAccountDisplayEmail);
+      case 'codebuddy':
+        if (!usePlatformPackageStore.getState().canOpenPlatform('codebuddy')) return [];
+        return getProviderAccounts(useCodebuddyAccountStore, getCodebuddyAccountDisplayEmail);
+      case 'codebuddy_cn':
+        if (!usePlatformPackageStore.getState().canOpenPlatform('codebuddy_cn')) return [];
+        return getProviderAccounts(useCodebuddyCnAccountStore, getCodebuddyAccountDisplayEmail);
+      case 'workbuddy':
+        if (!usePlatformPackageStore.getState().canOpenPlatform('workbuddy')) return [];
+        return getProviderAccounts(useWorkbuddyAccountStore, getWorkbuddyAccountDisplayEmail);
+      case 'qoder':
+        return getProviderAccounts(useQoderAccountStore, getQoderAccountDisplayEmail);
+      case 'trae':
+        return getProviderAccounts(useTraeAccountStore, getTraeAccountDisplayEmail);
+      case 'zed':
+        return getProviderAccounts(useZedAccountStore, getZedAccountDisplayEmail);
+      default:
+        return [];
+    }
+  };
+
+  const handleAccountOverrideChange = (
+    platform: CurrentAccountRefreshPlatform,
+    email: string,
+    value: string,
+  ) => {
+    if (value === 'inherit') {
+      removeAccountRefreshOverride(platform, email);
+      setAccountLevelRefreshCustomMode((prev) => {
+        const next = { ...prev };
+        delete next[`${platform}:${email}`];
+        return next;
+      });
+    } else if (value === 'custom') {
+      setAccountLevelRefreshCustomMode((prev) => ({
+        ...prev,
+        [`${platform}:${email}`]: true,
+      }));
+      const currentValue = accountOverrides[platform]?.[email];
+      if (currentValue !== undefined) {
+        setAccountRefreshMinutes(platform, email, currentValue);
+      } else {
+        setAccountRefreshMinutes(platform, email, 1);
+      }
+    } else {
+      setAccountRefreshMinutes(platform, email, Number(value));
+      setAccountLevelRefreshCustomMode((prev) => {
+        const next = { ...prev };
+        delete next[`${platform}:${email}`];
+        return next;
+      });
+    }
+    setAccountOverrides(loadAccountRefreshOverrides());
+  };
+
+  const renderAccountLevelRefreshConfig = (platform: CurrentAccountRefreshPlatform) => {
+    const accounts = getAccountsForPlatform(platform);
+    if (accounts.length === 0) {
+      return null;
+    }
+
+    const platformOverrides = accountOverrides[platform] ?? {};
+    const hasAnyOverride = Object.keys(platformOverrides).length > 0;
+
+    return (
+      <div className="settings-row">
+        <div className="row-label">
+          <div className="row-title">
+            {t('settings.general.accountLevelRefreshTitle', '账号级刷新配置')}
+          </div>
+          <div className="row-desc">
+            {t(
+              'settings.general.accountLevelRefreshDesc',
+              '为不同账号设置不同的自动刷新间隔，覆盖平台级默认值。',
+            )}
+          </div>
+        </div>
+        <div className="row-control">
+          <details>
+            <summary style={{ cursor: 'pointer', fontSize: '13px', color: 'var(--text-secondary)' }}>
+              {hasAnyOverride
+                ? t('settings.general.accountLevelRefreshSummaryActive', '已配置 {{count}} 个账号', {
+                    count: Object.keys(platformOverrides).length,
+                  })
+                : t('settings.general.accountLevelRefreshSummary', '展开配置')}
+            </summary>
+            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {accounts.map((account) => {
+                const overrideValue = platformOverrides[account.email];
+                const isCustomMode = accountLevelRefreshCustomMode[`${platform}:${account.email}`];
+                const isPreset = overrideValue !== undefined && [1, 2, 5, 10, 15, -1].includes(overrideValue);
+                const selectValue = isCustomMode
+                  ? 'custom'
+                  : (overrideValue !== undefined ? String(overrideValue) : 'inherit');
+                return (
+                  <div
+                    key={account.id}
+                    style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
+                  >
+                    <span
+                      style={{
+                        flex: 1,
+                        fontSize: '13px',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={account.email}
+                    >
+                      {account.email}
+                    </span>
+                    {isCustomMode ? (
+                      <div className="settings-inline-input" style={{ minWidth: '100px', width: 'auto' }}>
+                        <input
+                          type="number"
+                          min={1}
+                          max={999}
+                          className="settings-select settings-select--input-mode settings-select--with-unit"
+                          value={overrideValue !== undefined ? String(overrideValue) : '1'}
+                          placeholder={t('quickSettings.inputMinutes', '输入分钟数')}
+                          onChange={(e) => {
+                            const sanitized = sanitizeNumberInput(e.target.value);
+                            if (sanitized) {
+                              setAccountRefreshMinutes(platform, account.email, Number(sanitized));
+                              setAccountOverrides(loadAccountRefreshOverrides());
+                            }
+                          }}
+                          onBlur={() => {
+                            const currentValue = overrideValue !== undefined ? String(overrideValue) : '1';
+                            const normalized = normalizeNumberInput(currentValue, 1, 999);
+                            setAccountRefreshMinutes(platform, account.email, Number(normalized));
+                            setAccountOverrides(loadAccountRefreshOverrides());
+                            setAccountLevelRefreshCustomMode((prev) => {
+                              const next = { ...prev };
+                              delete next[`${platform}:${account.email}`];
+                              return next;
+                            });
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.preventDefault();
+                              const currentValue = overrideValue !== undefined ? String(overrideValue) : '1';
+                              const normalized = normalizeNumberInput(currentValue, 1, 999);
+                              setAccountRefreshMinutes(platform, account.email, Number(normalized));
+                              setAccountOverrides(loadAccountRefreshOverrides());
+                              setAccountLevelRefreshCustomMode((prev) => {
+                                const next = { ...prev };
+                                delete next[`${platform}:${account.email}`];
+                                return next;
+                              });
+                            }
+                          }}
+                        />
+                        <span className="settings-input-unit">{t('settings.general.minutes')}</span>
+                      </div>
+                    ) : (
+                      <select
+                        className="settings-select"
+                        style={{ minWidth: '100px', width: 'auto', fontSize: '12px' }}
+                        value={selectValue}
+                        onChange={(e) =>
+                          handleAccountOverrideChange(platform, account.email, e.target.value)
+                        }
+                      >
+                        <option value="inherit">
+                          {t('settings.general.accountLevelRefreshInherit', '继承平台设置')}
+                        </option>
+                        <option value="-1">
+                          {t('settings.general.accountLevelRefreshDisabled', '禁用')}
+                        </option>
+                        <option value="1">1 {t('settings.general.minutes')}</option>
+                        <option value="2">2 {t('settings.general.minutes')}</option>
+                        <option value="5">5 {t('settings.general.minutes')}</option>
+                        <option value="10">10 {t('settings.general.minutes')}</option>
+                        <option value="15">15 {t('settings.general.minutes')}</option>
+                        {!isPreset && overrideValue !== undefined && overrideValue > 0 && (
+                          <option value={String(overrideValue)}>
+                            {overrideValue} {t('settings.general.minutes')}
+                          </option>
+                        )}
+                        <option value="custom">{t('settings.general.autoRefreshCustom', '自定义')}</option>
+                      </select>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </details>
+        </div>
+      </div>
+    );
+  };
+
+  const renderPlatformAutoRefreshRow = ({
+    title,
+    description,
+    value,
+    setValue,
+    customMode,
+    setCustomMode,
+    isPreset,
+  }: {
+    title: string;
+    description: string;
+    value: string;
+    setValue: (value: string) => void;
+    customMode: boolean;
+    setCustomMode: (enabled: boolean) => void;
+    isPreset: boolean;
+  }) => (
+    <div className="settings-row">
+      <div className="row-label">
+        <div className="row-title">{title}</div>
+        <div className="row-desc">{description}</div>
+      </div>
+      <div className="row-control">
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {customMode ? (
+            <div className="settings-inline-input" style={{ minWidth: '120px', width: 'auto' }}>
+              <input
+                type="number"
+                min={1}
+                max={999}
+                className="settings-select settings-select--input-mode settings-select--with-unit"
+                value={value}
+                placeholder={t('quickSettings.inputMinutes', '输入分钟数')}
+                onChange={(event) => setValue(sanitizeNumberInput(event.target.value))}
+                onBlur={() => {
+                  setValue(normalizeNumberInput(value, 1, 999));
+                  setCustomMode(false);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    setValue(normalizeNumberInput(value, 1, 999));
+                    setCustomMode(false);
+                  }
+                }}
+              />
+              <span className="settings-input-unit">{t('settings.general.minutes')}</span>
+            </div>
+          ) : (
+            <select
+              className="settings-select"
+              style={{ minWidth: '120px', width: 'auto' }}
+              value={value}
+              onChange={(event) => {
+                const nextValue = event.target.value;
+                if (nextValue === 'custom') {
+                  setCustomMode(true);
+                  setValue(value !== '-1' ? value : '1');
+                  return;
+                }
+                setCustomMode(false);
+                setValue(nextValue);
+              }}
+            >
+              {!isPreset && (
+                <option value={value}>
+                  {value} {t('settings.general.minutes')}
+                </option>
+              )}
+              <option value="-1">{t('settings.general.autoRefreshDisabled')}</option>
+              <option value="2">2 {t('settings.general.minutes')}</option>
+              <option value="5">5 {t('settings.general.minutes')}</option>
+              <option value="10">10 {t('settings.general.minutes')}</option>
+              <option value="15">15 {t('settings.general.minutes')}</option>
+              <option value="custom">{t('settings.general.autoRefreshCustom')}</option>
+            </select>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderPlatformQuotaAlertRows = ({
+    enabled,
+    setEnabled,
+    threshold,
+    setThreshold,
+    customMode,
+    setCustomMode,
+    isPreset,
+  }: {
+    enabled: boolean;
+    setEnabled: (enabled: boolean) => void;
+    threshold: string;
+    setThreshold: (value: string) => void;
+    customMode: boolean;
+    setCustomMode: (enabled: boolean) => void;
+    isPreset: boolean;
+  }) => (
+    <>
+      <div className="settings-row">
+        <div className="row-label">
+          <div className="row-title">{t('quickSettings.quotaAlert.enable', '超额预警')}</div>
+          <div className="row-desc">
+            {t(
+              'quickSettings.quotaAlert.hint',
+              '当当前账号任意模型配额低于阈值时，发送原生通知并在页面提示快捷切号。',
+            )}
+          </div>
+        </div>
+        <div className="row-control">
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => setEnabled(event.target.checked)}
+            />
+            <span className="slider"></span>
+          </label>
+        </div>
+      </div>
+      {enabled && (
+        <div className="settings-row" style={{ animation: 'fadeUp 0.3s ease both' }}>
+          <div className="row-label">
+            <div className="row-title">{t('quickSettings.quotaAlert.threshold', '预警阈值')}</div>
+            <div className="row-desc">
+              {t('quickSettings.quotaAlert.thresholdDesc', '任意模型配额低于此百分比时触发预警')}
+            </div>
+          </div>
+          <div className="row-control">
+            {customMode ? (
+              <div className="settings-inline-input">
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  className="settings-select settings-select--input-mode settings-select--with-unit"
+                  value={threshold}
+                  placeholder={t('quickSettings.inputPercent', '输入百分比')}
+                  onChange={(event) => setThreshold(sanitizeNumberInput(event.target.value))}
+                  onBlur={() => {
+                    setThreshold(normalizeNumberInput(threshold, 0, 100));
+                    setCustomMode(false);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      setThreshold(normalizeNumberInput(threshold, 0, 100));
+                      setCustomMode(false);
+                    }
+                  }}
+                />
+                <span className="settings-input-unit">%</span>
+              </div>
+            ) : (
+              <select
+                className="settings-select"
+                value={threshold}
+                onChange={(event) => {
+                  const nextValue = event.target.value;
+                  if (nextValue === 'custom') {
+                    setCustomMode(true);
+                    setThreshold(threshold || '20');
+                    return;
+                  }
+                  setCustomMode(false);
+                  setThreshold(nextValue);
+                }}
+              >
+                {!isPreset && <option value={threshold}>{threshold}%</option>}
+                <option value="0">0%</option>
+                <option value="20">20%</option>
+                <option value="40">40%</option>
+                <option value="60">60%</option>
+                <option value="custom">{t('settings.general.autoRefreshCustom')}</option>
+              </select>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+
   const autoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(autoRefresh);
   const codexAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(codexAutoRefresh);
+  const claudeAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(claudeAutoRefresh);
   const ghcpAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(ghcpAutoRefresh);
   const windsurfAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(windsurfAutoRefresh);
   const kiroAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(kiroAutoRefresh);
@@ -1671,6 +2272,7 @@ export function SettingsPage() {
   );
   const quotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(quotaAlertThreshold);
   const codexQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(codexQuotaAlertThreshold);
+  const claudeQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(claudeQuotaAlertThreshold);
   const ghcpQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(ghcpQuotaAlertThreshold);
   const windsurfQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(windsurfQuotaAlertThreshold);
   const kiroQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(kiroQuotaAlertThreshold);
@@ -1791,7 +2393,7 @@ export function SettingsPage() {
 
   return (
     <main className="main-content">
-      <div className="page-tabs-row">
+      <div className="page-tabs-row settings-page-tabs-row">
         <div className="page-tabs-label">{t('settings.title')}</div>
         <div className="page-tabs filter-tabs">
           <button 
@@ -1805,6 +2407,12 @@ export function SettingsPage() {
             onClick={() => setActiveTab('network')}
           >
             {t('settings.tabs.network')}
+          </button>
+          <button 
+            className={`filter-tab ${activeTab === 'data' ? 'active' : ''}`}
+            onClick={() => setActiveTab('data')}
+          >
+            {t('settings.tabs.data', '数据管理')}
           </button>
           <button 
             className={`filter-tab ${activeTab === 'about' ? 'active' : ''}`}
@@ -1896,6 +2504,26 @@ export function SettingsPage() {
 
               <div className="settings-row">
                 <div className="row-label">
+                  <div className="row-title">{t('settings.general.startupPage', '启动页面')}</div>
+                  <div className="row-desc">
+                    {t('settings.general.startupPageDesc', '设置应用冷启动后默认打开的页面')}
+                  </div>
+                </div>
+                <div className="row-control">
+                  <select
+                    className="settings-select"
+                    value={startupPage}
+                    onChange={(e) => setStartupPage(normalizeStartupPageValue(e.target.value))}
+                  >
+                    {startupPageOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="row-label">
                   <div className="row-title">{t('settings.general.uiScale')}</div>
                   <div className="row-desc">{t('settings.general.uiScaleDesc')}</div>
                 </div>
@@ -1926,6 +2554,30 @@ export function SettingsPage() {
                     <option value="ask">{t('settings.general.closeBehaviorAsk')}</option>
                     <option value="minimize">{t('settings.general.closeBehaviorMinimize')}</option>
                     <option value="quit">{t('settings.general.closeBehaviorQuit')}</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="row-label">
+                  <div className="row-title">
+                    {t('settings.general.startupMinimized', '启动后自动最小化')}
+                  </div>
+                  <div className="row-desc">
+                    {t(
+                      'settings.general.startupMinimizedDesc',
+                      '应用启动完成后自动最小化主窗口，可从 Dock、任务栏或托盘恢复'
+                    )}
+                  </div>
+                </div>
+                <div className="row-control">
+                  <select
+                    className="settings-select"
+                    value={startupMinimized ? 'true' : 'false'}
+                    onChange={(e) => setStartupMinimized(e.target.value === 'true')}
+                  >
+                    <option value="false">{t('common.disable', '停用')}</option>
+                    <option value="true">{t('common.enable', '启用')}</option>
                   </select>
                 </div>
               </div>
@@ -2109,19 +2761,28 @@ export function SettingsPage() {
 
               <div className="settings-row">
                 <div className="row-label">
-                  <div className="row-title">{t('settings.general.fpDir')}</div>
-                  <div className="row-desc">{t('settings.general.fpDirDesc')}</div>
+                  <div className="row-title">
+                    {t('settings.general.topRightAdVisible', '显示顶部推广')}
+                  </div>
+                  <div className="row-desc">
+                    {t(
+                      'settings.general.topRightAdVisibleDesc',
+                      '关闭后隐藏应用顶部推广位。'
+                    )}
+                  </div>
                 </div>
                 <div className="row-control">
-                  <button className="btn btn-secondary" onClick={() => accountService.openDeviceFolder()}>
-                    <FolderOpen size={16} />{t('common.open')}
-                  </button>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={topRightAdVisible}
+                      onChange={(e) => setTopRightAdVisible(e.target.checked)}
+                    />
+                    <span className="slider"></span>
+                  </label>
                 </div>
               </div>
             </div>
-
-            <SettingsAccountTransferSection />
-
             <div style={{ display: 'flex', flexDirection: 'column' }}>
               <div style={{ order: platformSettingsOrder.antigravity }}>
                 <div className="group-title">{t('settings.general.antigravitySettingsTitle', 'Antigravity IDE 设置')}</div>
@@ -2211,6 +2872,7 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('antigravity')}
+              {renderAccountLevelRefreshConfig('antigravity')}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -2643,6 +3305,46 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('codex')}
+              {renderAccountLevelRefreshConfig('codex')}
+
+              {isWindows && (
+                <>
+                  <div className="settings-row">
+                    <div className="row-label">
+                      <div className="row-title">{t('settings.general.codexSyncWsl')}</div>
+                      <div className="row-desc">{t('settings.general.codexSyncWslDesc')}</div>
+                    </div>
+                    <div className="row-control">
+                      <label className="switch">
+                        <input
+                          type="checkbox"
+                          checked={codexSyncWsl}
+                          onChange={(e) => setCodexSyncWsl(e.target.checked)}
+                        />
+                        <span className="slider"></span>
+                      </label>
+                    </div>
+                  </div>
+
+                  {codexSyncWsl && (
+                    <div className="settings-row">
+                      <div className="row-label">
+                        <div className="row-title">{t('settings.general.codexWslConfigDir')}</div>
+                        <div className="row-desc">{t('settings.general.codexWslConfigDirDesc')}</div>
+                      </div>
+                      <div className="row-control row-control--grow">
+                        <input
+                          type="text"
+                          className="settings-input settings-input--path"
+                          value={codexWslConfigDir}
+                          placeholder={t('settings.general.codexWslConfigDirPlaceholder')}
+                          onChange={(e) => setCodexWslConfigDir(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -2963,6 +3665,152 @@ export function SettingsPage() {
 
               </div>
 
+              <div style={{ order: platformSettingsOrder.claude_manager }}>
+                <div className="group-title">
+                  {t('settings.general.claudeSettingsTitle', 'Claude 设置')}
+                </div>
+                <div className="settings-group">
+                  {renderPlatformAutoRefreshRow({
+                    title: t(
+                      'settings.general.claudeAutoRefresh',
+                      'Claude 自动刷新配额',
+                    ),
+                    description: t(
+                      'settings.general.claudeAutoRefreshDesc',
+                      '后台自动更新 Claude 账号配额缓存',
+                    ),
+                    value: claudeAutoRefresh,
+                    setValue: setClaudeAutoRefresh,
+                    customMode: claudeAutoRefreshCustomMode,
+                    setCustomMode: setClaudeAutoRefreshCustomMode,
+                    isPreset: claudeAutoRefreshIsPreset,
+                  })}
+                  {renderCurrentAccountRefreshRow('claude')}
+                  {renderAccountLevelRefreshConfig('claude')}
+                  <div className="settings-row settings-row--align-start">
+                    <div className="row-label">
+                      <div className="row-title">
+                        {t('settings.general.claudeAppPath', 'Claude Desktop 启动目标')}
+                      </div>
+                      <div className="row-desc">
+                        {t(
+                          'settings.general.claudeAppPathDesc',
+                          '默认实例可使用 Microsoft Store 应用目标；多开实例请选择真实 Claude.exe。',
+                        )}
+                      </div>
+                    </div>
+                    <div className="row-control row-control--grow settings-claude-launch-control">
+                      <div className="settings-claude-scan-roots">
+                        <label>{t('appPath.missing.scanRoots', '扫描范围')}</label>
+                        <div className="settings-claude-scan-root-row">
+                          <input
+                            type="text"
+                            className="settings-input settings-claude-scan-roots-input"
+                            value={claudeAppScanRoots}
+                            placeholder={t(
+                              'appPath.missing.scanRootsPlaceholder',
+                              '可选，选择一个目录或盘符；留空时按盘符扫描 WindowsApps 并补充开始菜单应用。',
+                            )}
+                            readOnly
+                          />
+                          <button
+                            className="btn btn-secondary"
+                            onClick={handlePickClaudeScanRoot}
+                            disabled={isAppPathResetDetecting('claude')}
+                          >
+                            {t('settings.general.codexPathSelect', '选择')}
+                          </button>
+                          <button
+                            className="btn btn-secondary"
+                            onClick={handleClearClaudeScanRoot}
+                            disabled={
+                              isAppPathResetDetecting('claude') || !claudeAppScanRoots.trim()
+                            }
+                          >
+                            {t('common.clear', '清除')}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="settings-claude-launch-row">
+                        <input
+                          type="text"
+                          className="settings-input settings-input--path"
+                          value={claudeAppPath}
+                          placeholder={t(
+                            'quickSettings.claude.appTargetPlaceholder',
+                            'Claude.exe 路径或 shell:AppsFolder\\...',
+                          )}
+                          onChange={(e) => setClaudeAppPath(e.target.value)}
+                        />
+                        <button
+                          className="btn btn-secondary"
+                          onClick={() => handlePickAppPath('claude')}
+                          disabled={isAppPathResetDetecting('claude')}
+                        >
+                          {t('settings.general.codexPathSelect', '选择')}
+                        </button>
+                        <button
+                          className="btn btn-secondary"
+                          onClick={() => handleResetAppPath('claude')}
+                          disabled={isAppPathResetDetecting('claude')}
+                        >
+                          <RefreshCw
+                            size={16}
+                            className={isAppPathResetDetecting('claude') ? 'spin' : undefined}
+                          />
+                          {isAppPathResetDetecting('claude')
+                            ? t('common.loading', '加载中...')
+                            : getResetLabelByTarget('claude')}
+                        </button>
+                      </div>
+                      {claudeLaunchCandidates.length > 0 ? (
+                        <div className="settings-claude-candidate-list">
+                          {claudeLaunchCandidates.map((candidate) => (
+                            <button
+                              key={`${candidate.target_type}:${candidate.target}`}
+                              type="button"
+                              className={`settings-claude-candidate-item${
+                                claudeAppPath.trim() === candidate.target ? ' selected' : ''
+                              }`}
+                              onClick={() => handleSelectClaudeLaunchCandidate(candidate)}
+                            >
+                              <div className="settings-claude-candidate-main">
+                                <span>{candidate.label || 'Claude Desktop'}</span>
+                                <span className="settings-claude-candidate-badge">
+                                  {candidate.target_type === 'windows_app'
+                                    ? t('appPath.missing.windowsApp', 'Microsoft Store')
+                                    : 'EXE'}
+                                </span>
+                              </div>
+                              <div className="settings-claude-candidate-target">
+                                {candidate.target}
+                              </div>
+                              {!candidate.supports_multi_instance ? (
+                                <div className="settings-claude-candidate-note">
+                                  {t(
+                                    'appPath.missing.defaultOnly',
+                                    '仅适用于默认桌面端；多开实例请选择真实 Claude.exe',
+                                  )}
+                                </div>
+                              ) : null}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  {renderPlatformQuotaAlertRows({
+                    enabled: claudeQuotaAlertEnabled,
+                    setEnabled: setClaudeQuotaAlertEnabled,
+                    threshold: claudeQuotaAlertThreshold,
+                    setThreshold: setClaudeQuotaAlertThreshold,
+                    customMode: claudeQuotaAlertThresholdCustomMode,
+                    setCustomMode: setClaudeQuotaAlertThresholdCustomMode,
+                    isPreset: claudeQuotaAlertThresholdIsPreset,
+                  })}
+                </div>
+              </div>
+
               <div style={{ order: platformSettingsOrder['github-copilot'] }}>
                 <div className="group-title">{t('settings.general.githubCopilotSettingsTitle', 'GitHub Copilot 设置')}</div>
                 <div className="settings-group">
@@ -3033,6 +3881,7 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('ghcp')}
+              {renderAccountLevelRefreshConfig('ghcp')}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -3220,6 +4069,7 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('windsurf')}
+              {renderAccountLevelRefreshConfig('windsurf')}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -3407,6 +4257,7 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('kiro')}
+              {renderAccountLevelRefreshConfig('kiro')}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -3595,6 +4446,7 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('codebuddy')}
+              {renderAccountLevelRefreshConfig('codebuddy')}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -3785,6 +4637,7 @@ export function SettingsPage() {
                   </div>
 
                   {renderCurrentAccountRefreshRow('codebuddy_cn')}
+                  {renderAccountLevelRefreshConfig('codebuddy_cn')}
 
                   <div className="settings-row">
                     <div className="row-label">
@@ -3975,6 +4828,7 @@ export function SettingsPage() {
                   </div>
 
                   {renderCurrentAccountRefreshRow('qoder')}
+                  {renderAccountLevelRefreshConfig('qoder')}
 
                   <div className="settings-row">
                     <div className="row-label">
@@ -4165,6 +5019,7 @@ export function SettingsPage() {
                   </div>
 
                   {renderCurrentAccountRefreshRow('trae')}
+                  {renderAccountLevelRefreshConfig('trae')}
 
                   <div className="settings-row">
                     <div className="row-label">
@@ -4355,6 +5210,7 @@ export function SettingsPage() {
                   </div>
 
                   {renderCurrentAccountRefreshRow('workbuddy')}
+                  {renderAccountLevelRefreshConfig('workbuddy')}
 
                   <div className="settings-row">
                     <div className="row-label">
@@ -4543,6 +5399,7 @@ export function SettingsPage() {
                   </div>
 
                   {renderCurrentAccountRefreshRow('zed')}
+                  {renderAccountLevelRefreshConfig('zed')}
 
                   <div className="settings-row">
                     <div className="row-label">
@@ -4729,6 +5586,7 @@ export function SettingsPage() {
               </div>
 
               {renderCurrentAccountRefreshRow('cursor')}
+              {renderAccountLevelRefreshConfig('cursor')}
 
               <div className="settings-row">
                 <div className="row-label">
@@ -4934,6 +5792,7 @@ export function SettingsPage() {
                   )}
 
                   {renderCurrentAccountRefreshRow('gemini')}
+                  {renderAccountLevelRefreshConfig('gemini')}
 
                   <div className="settings-row">
                     <div className="row-label">
@@ -5016,6 +5875,13 @@ export function SettingsPage() {
               </div>
             </div>
 
+          </>
+        )}
+
+        {activeTab === 'data' && (
+          <>
+            <SettingsAccountTransferSection />
+            <SettingsWebdavSyncSection />
           </>
         )}
 
@@ -5390,7 +6256,7 @@ export function SettingsPage() {
         </div>
       </div>
       {releaseHistoryOpen && (
-        <div className="modal-overlay" onClick={handleCloseReleaseHistory}>
+        <div className="modal-overlay">
           <div className="modal settings-release-history-modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h2>{t('settings.about.releaseHistoryTitle', '更新记录')}</h2>

@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { InstancesManager } from '../components/InstancesManager';
 import { OverviewTabsHeader } from '../components/OverviewTabsHeader';
+import { useAntigravityRuntimeTarget } from '../hooks/useAntigravityRuntimeTarget';
 import { useAccountStore } from '../stores/useAccountStore';
+import { useAntigravityLegacyInstanceStore } from '../stores/useAntigravityLegacyInstanceStore';
 import { useInstanceStore } from '../stores/useInstanceStore';
 import type { Account } from '../types/account';
 import { Page } from '../types/navigation';
@@ -21,12 +23,18 @@ import {
 
 interface InstancesPageProps {
   onNavigate?: (page: Page) => void;
+  hideHeader?: boolean;
 }
 
-export function InstancesPage({ onNavigate }: InstancesPageProps) {
+export function InstancesPage({ onNavigate, hideHeader = false }: InstancesPageProps) {
   const { t } = useTranslation();
-  const instanceStore = useInstanceStore();
-  const { accounts, currentAccount, fetchAccounts } = useAccountStore();
+  const runtimeTarget = useAntigravityRuntimeTarget();
+  const legacyInstanceStore = useAntigravityLegacyInstanceStore();
+  const ideInstanceStore = useInstanceStore();
+  const instanceStore =
+    runtimeTarget === 'antigravity' ? legacyInstanceStore : ideInstanceStore;
+  const { accounts, currentAccountsByTarget, fetchAccounts, fetchCurrentAccount } = useAccountStore();
+  const currentAccount = currentAccountsByTarget[runtimeTarget] ?? null;
   const [displayGroups, setDisplayGroups] = useState<DisplayGroup[]>([]);
   const [sortBy] = useState(() =>
     normalizeAntigravitySortBy(
@@ -53,6 +61,11 @@ export function InstancesPage({ onNavigate }: InstancesPageProps) {
     () => [...accounts].sort(accountSortComparator),
     [accountSortComparator, accounts],
   );
+
+  useEffect(() => {
+    fetchAccounts();
+    fetchCurrentAccount(runtimeTarget);
+  }, [fetchAccounts, fetchCurrentAccount, runtimeTarget]);
 
   useEffect(() => {
     getDisplayGroups()
@@ -86,11 +99,13 @@ export function InstancesPage({ onNavigate }: InstancesPageProps) {
 
   return (
     <div className="instances-page">
-      <OverviewTabsHeader
-        active="instances"
-        onNavigate={onNavigate}
-        subtitle={t('instances.subtitle', '多实例独立配置，多账号并行运行。')}
-      />
+      {!hideHeader && (
+        <OverviewTabsHeader
+          active="instances"
+          onNavigate={onNavigate}
+          subtitle={t('instances.subtitle', '多实例独立配置，多账号并行运行。')}
+        />
+      )}
       <InstancesManager
         instanceStore={instanceStore}
         accounts={sortedAccountsForSelect}
@@ -106,7 +121,7 @@ export function InstancesPage({ onNavigate }: InstancesPageProps) {
           const presentation = buildAntigravityAccountPresentation(account, displayGroups, t);
           return `${presentation.displayName} ${presentation.planLabel} ${account.name ?? ''}`;
         }}
-        appType="antigravity"
+        appType={runtimeTarget}
       />
     </div>
   );

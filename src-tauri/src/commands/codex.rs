@@ -1,32 +1,58 @@
 use crate::models::codex::{
-    CodexAccount, CodexApiProviderMode, CodexAppSpeed, CodexAppSpeedConfig, CodexQuickConfig,
-    CodexQuota, CodexTokens,
+    CodexAccount, CodexApiProviderMode, CodexAppSpeed, CodexAppSpeedConfig, CodexFileImportResult,
+    CodexQuickConfig, CodexQuota,
 };
 use crate::models::codex_local_access::{
-    CodexLocalAccessCustomRoutingRule, CodexLocalAccessGatewayMode, CodexLocalAccessModelAlias,
-    CodexLocalAccessModelPricing, CodexLocalAccessPortCleanupResult, CodexLocalAccessRequestKind,
+    CodexLocalAccessAccountModelRule, CodexLocalAccessChatMessage, CodexLocalAccessChatResult,
+    CodexLocalAccessClientBaseUrlHost, CodexLocalAccessCustomRoutingRule,
+    CodexLocalAccessGatewayMode, CodexLocalAccessModelAlias, CodexLocalAccessModelPricing,
+    CodexLocalAccessPortCleanupResult, CodexLocalAccessRequestKind,
     CodexLocalAccessRoutingStrategy, CodexLocalAccessScope, CodexLocalAccessState,
-    CodexLocalAccessTestResult, CodexLocalAccessUsageEventPage,
+    CodexLocalAccessTestResult, CodexLocalAccessTimeoutPreset, CodexLocalAccessTimeouts,
+    CodexLocalAccessUsageEventPage,
 };
-use crate::modules::{
-    account, codex_account, codex_local_access, codex_oauth, codex_quota, codex_session_visibility,
-    codex_speed, codex_wakeup, codex_wakeup_scheduler, config, logger, openclaw_auth,
-    opencode_auth, process,
-};
+use crate::modules::{logger, platform_adapter, process};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tauri::Emitter;
 use tauri_plugin_opener::OpenerExt;
 
 static CODEX_POST_REFRESH_CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+const CODEX_LOCAL_ACCESS_FAST_MUTATION_TIMEOUT: Duration = Duration::from_secs(20);
+const CODEX_FAST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn restart_codex_specified_app_if_enabled(user_config: &config::UserConfig) {
-    if !user_config.codex_restart_specified_app_on_switch {
-        logger::log_info("已关闭切换 Codex 时自动重启指定应用");
-        return;
-    }
+fn call_codex_local_access_fast<T: DeserializeOwned>(
+    method: &str,
+    payload: Value,
+) -> Result<T, String> {
+    platform_adapter::call_codex_with_timeout(
+        method,
+        payload,
+        CODEX_LOCAL_ACCESS_FAST_MUTATION_TIMEOUT,
+    )
+}
 
-    let path = user_config.codex_specified_app_path.trim();
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexSwitchPostActions {
+    codex_launch_on_switch: bool,
+    opencode_restart_app_path: Option<String>,
+    restart_specified_app_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchCodexAccountResult {
+    account: CodexAccount,
+    post_actions: CodexSwitchPostActions,
+}
+
+fn restart_codex_specified_app_by_path(path: &str) {
+    let path = path.trim();
     if path.is_empty() {
         logger::log_warn("已开启切换 Codex 时自动重启指定应用，但未配置应用路径，已跳过");
         return;
@@ -42,128 +68,26 @@ fn restart_codex_specified_app_if_enabled(user_config: &config::UserConfig) {
     }
 }
 
-fn read_default_codex_history_provider_for_switch() -> Option<String> {
-    let codex_home = codex_account::get_codex_home();
-    match codex_session_visibility::read_history_visibility_provider_for_dir(&codex_home) {
-        Ok(provider) => Some(provider),
-        Err(error) => {
-            logger::log_warn(&format!(
-                "[Codex切号] 读取切号前后会话 provider 失败: dir={}, error={}",
-                codex_home.display(),
-                error
-            ));
-            None
-        }
-    }
-}
-
-fn codex_history_provider_changed(
-    previous_provider: Option<&str>,
-    next_provider: Option<&str>,
-) -> bool {
-    match (previous_provider, next_provider) {
-        (Some(previous), Some(next)) => previous != next,
-        _ => false,
-    }
-}
-
-fn should_close_default_codex_before_switch_repair(user_config: &config::UserConfig) -> bool {
-    if !user_config.codex_launch_on_switch {
-        return false;
-    }
-
-    let default_settings = match crate::modules::codex_instance::load_default_settings() {
-        Ok(settings) => settings,
-        Err(error) => {
-            logger::log_warn(&format!(
-                "[Codex切号] 会话可见性修复前读取默认实例设置失败，跳过提前关闭默认实例: {}",
-                error
-            ));
-            return false;
-        }
-    };
-
-    if default_settings.launch_mode == crate::models::InstanceLaunchMode::Cli {
-        return true;
-    }
-
-    match process::ensure_codex_launch_path_configured() {
-        Ok(()) => true,
-        Err(error) => {
-            logger::log_warn(&format!(
-                "[Codex切号] Codex 启动路径未就绪，跳过会话可见性修复前的提前关闭: {}",
-                error
-            ));
-            false
-        }
-    }
-}
-
-fn repair_codex_session_visibility_after_provider_change(
-    previous_provider: Option<String>,
-    next_provider: Option<String>,
-    user_config: &config::UserConfig,
-) {
-    if !codex_history_provider_changed(previous_provider.as_deref(), next_provider.as_deref()) {
-        return;
-    }
-
-    let previous_label = previous_provider.as_deref().unwrap_or("<unknown>");
-    let next_label = next_provider.as_deref().unwrap_or("<unknown>");
-    logger::log_info(&format!(
-        "[Codex切号] 检测到会话 provider 变化，准备修复历史会话可见性: {} -> {}",
-        previous_label, next_label
-    ));
-
-    if should_close_default_codex_before_switch_repair(user_config) {
-        match process::close_codex_default(20) {
-            Ok(()) => logger::log_info("[Codex切号] 已在会话可见性修复前关闭默认 Codex 实例"),
-            Err(error) => logger::log_warn(&format!(
-                "[Codex切号] 会话可见性修复前关闭默认 Codex 实例失败，继续尝试修复: {}",
-                error
-            )),
-        }
-    }
-
-    match codex_session_visibility::repair_session_visibility_across_instances() {
-        Ok(summary) => {
-            logger::log_info(&format!(
-                "[Codex切号] 会话可见性修复完成: mutated_instances={}, rollout_files={}, official_rebuild=true, message={}",
-                summary.mutated_instance_count,
-                summary.changed_rollout_file_count,
-                summary.message
-            ));
-        }
-        Err(error) => {
-            logger::log_warn(&format!(
-                "[Codex切号] 会话可见性自动修复失败，切号已完成，可稍后在会话管理中手动重试: {}",
-                error
-            ));
-        }
-    }
-}
-
 /// 列出所有 Codex 账号
 #[tauri::command]
 pub fn list_codex_accounts() -> Result<Vec<CodexAccount>, String> {
-    codex_account::list_accounts_checked()
+    platform_adapter::call_codex("accounts.list", json!({}))
 }
 
 /// 获取当前激活的 Codex 账号
 #[tauri::command]
 pub fn get_current_codex_account() -> Result<Option<CodexAccount>, String> {
-    Ok(codex_account::get_current_account())
+    platform_adapter::call_codex("accounts.current", json!({}))
 }
 
 #[tauri::command]
 pub fn get_codex_config_toml_path() -> Result<String, String> {
-    let path = codex_account::get_codex_home().join("config.toml");
-    Ok(path.to_string_lossy().to_string())
+    platform_adapter::call_codex("config.path", json!({}))
 }
 
 #[tauri::command]
 pub fn open_codex_config_toml(app: AppHandle) -> Result<(), String> {
-    let path = codex_account::get_codex_home().join("config.toml");
+    let path = std::path::PathBuf::from(get_codex_config_toml_path()?);
     if !path.exists() {
         return Err(format!("未找到 Codex config.toml 文件: {}", path.display()));
     }
@@ -175,7 +99,7 @@ pub fn open_codex_config_toml(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_codex_quick_config() -> Result<CodexQuickConfig, String> {
-    codex_account::load_current_quick_config()
+    platform_adapter::call_codex("config.quick.get", json!({}))
 }
 
 #[tauri::command]
@@ -183,37 +107,35 @@ pub fn save_codex_quick_config(
     model_context_window: Option<i64>,
     auto_compact_token_limit: Option<i64>,
 ) -> Result<CodexQuickConfig, String> {
-    codex_account::save_current_quick_config(model_context_window, auto_compact_token_limit)
+    platform_adapter::call_codex(
+        "config.quick.save",
+        json!({
+            "modelContextWindow": model_context_window,
+            "autoCompactTokenLimit": auto_compact_token_limit,
+        }),
+    )
 }
 
 #[tauri::command]
 pub fn get_codex_app_speed_config() -> Result<CodexAppSpeedConfig, String> {
-    codex_speed::get_app_speed_config()
+    platform_adapter::call_codex("config.appSpeed.get", json!({}))
 }
 
 #[tauri::command]
 pub fn save_codex_app_speed(speed: CodexAppSpeed) -> Result<CodexAppSpeedConfig, String> {
-    codex_speed::save_api_service_app_speed(speed)
+    platform_adapter::call_codex("config.appSpeed.save", json!({ "speed": speed }))
 }
 
 #[tauri::command]
 pub fn get_codex_api_service_app_speed_config() -> Result<CodexAppSpeedConfig, String> {
-    codex_speed::get_api_service_app_speed_config()
+    platform_adapter::call_codex("config.apiServiceAppSpeed.get", json!({}))
 }
 
 #[tauri::command]
 pub fn save_codex_api_service_app_speed(
     speed: CodexAppSpeed,
 ) -> Result<CodexAppSpeedConfig, String> {
-    let saved = codex_speed::save_api_service_app_speed(speed.clone())?;
-    if let Ok(settings) = crate::modules::codex_instance::load_default_settings() {
-        if settings.bind_account_id.as_deref()
-            == Some(crate::modules::codex_instance::CODEX_API_SERVICE_BIND_ACCOUNT_ID)
-        {
-            let _ = crate::modules::codex_instance::update_default_app_speed(speed);
-        }
-    }
-    Ok(saved)
+    platform_adapter::call_codex("config.apiServiceAppSpeed.save", json!({ "speed": speed }))
 }
 
 #[tauri::command]
@@ -221,36 +143,19 @@ pub fn update_codex_account_app_speed(
     account_id: String,
     speed: CodexAppSpeed,
 ) -> Result<CodexAccount, String> {
-    let account = codex_account::update_account_app_speed(&account_id, speed)?;
-    let account_speed = account.app_speed.clone();
-    let current_account_id = codex_account::load_account_index().current_account_id;
-    let default_bind_account_id = crate::modules::codex_instance::load_default_settings()
-        .ok()
-        .and_then(|settings| settings.bind_account_id);
-    if current_account_id.as_deref() == Some(account_id.as_str())
-        || default_bind_account_id.as_deref() == Some(account_id.as_str())
-    {
-        codex_speed::write_official_app_speed(account_speed.clone())?;
-        let _ = crate::modules::codex_instance::update_default_app_speed(account_speed.clone());
-    }
-
-    let bound_instances = crate::modules::codex_instance::update_bound_instances_app_speed(
-        &account_id,
-        account_speed.clone(),
-    )?;
-    for instance in bound_instances {
-        codex_speed::write_app_speed_for_dir(
-            std::path::Path::new(&instance.user_data_dir),
-            account_speed.clone(),
-        )?;
-    }
-    Ok(account)
+    platform_adapter::call_codex(
+        "accounts.updateAppSpeed",
+        json!({ "accountId": account_id, "speed": speed }),
+    )
 }
 
 /// 刷新账号资料（团队名/结构）
 #[tauri::command]
 pub async fn refresh_codex_account_profile(account_id: String) -> Result<CodexAccount, String> {
-    codex_account::refresh_account_profile(&account_id).await
+    platform_adapter::call_codex(
+        "accounts.refreshProfile",
+        json!({ "accountId": account_id }),
+    )
 }
 
 /// 切换 Codex 账号（包含 token 刷新检查）
@@ -258,93 +163,56 @@ pub async fn refresh_codex_account_profile(account_id: String) -> Result<CodexAc
 pub async fn switch_codex_account(
     app: AppHandle,
     account_id: String,
+    auto_repair_mode: Option<String>,
 ) -> Result<CodexAccount, String> {
-    let previous_history_provider = read_default_codex_history_provider_for_switch();
-    // 切换账号（写入 auth.json）
-    let account = codex_account::switch_account_managed(&account_id).await?;
-    let next_history_provider = read_default_codex_history_provider_for_switch();
-    let account_speed = account.app_speed.clone();
-    codex_speed::write_official_app_speed(account_speed.clone())?;
+    let flow_started = Instant::now();
+    logger::log_info(&format!(
+        "[Codex Switch][Backend] switch_codex_account started: account_id={}",
+        account_id
+    ));
 
-    // 同步更新 Codex 默认实例的绑定账号（不同步到 Antigravity，因为账号体系不同）
-    if let Err(e) = crate::modules::codex_instance::update_default_settings(
-        Some(Some(account_id.clone())),
-        None,
-        Some(false),
-        None,
-    ) {
-        logger::log_warn(&format!("更新 Codex 默认实例绑定账号失败: {}", e));
-    } else {
+    let switch_started = Instant::now();
+    let result: SwitchCodexAccountResult = platform_adapter::call_codex(
+        "switch.account",
+        json!({
+            "accountId": account_id.clone(),
+            "autoRepairMode": auto_repair_mode,
+        }),
+    )?;
+    logger::log_info(&format!(
+        "[Codex Switch][Backend] switch.account adapter finished: account_id={}, elapsed_ms={}, total_ms={}",
+        account_id,
+        switch_started.elapsed().as_millis(),
+        flow_started.elapsed().as_millis()
+    ));
+
+    if let Some(opencode_app_path) = result.post_actions.opencode_restart_app_path.as_deref() {
+        let opencode_started = Instant::now();
+        if process::is_opencode_running() {
+            if let Err(e) = process::close_opencode(20) {
+                logger::log_warn(&format!("OpenCode 关闭失败: {}", e));
+            }
+        } else {
+            logger::log_info("OpenCode 未在运行，准备启动");
+        }
+        if let Err(e) = process::start_opencode_with_path(Some(opencode_app_path)) {
+            logger::log_warn(&format!("OpenCode 启动失败: {}", e));
+        }
         logger::log_info(&format!(
-            "已同步更新 Codex 默认实例绑定账号: {}",
-            account_id
+            "[Codex Switch][Backend] opencode restart post action finished: account_id={}, elapsed_ms={}, total_ms={}",
+            account_id,
+            opencode_started.elapsed().as_millis(),
+            flow_started.elapsed().as_millis()
         ));
     }
-    if let Err(e) = crate::modules::codex_instance::update_default_app_speed(account_speed) {
-        logger::log_warn(&format!("更新 Codex 默认实例速度失败: {}", e));
-    }
 
-    let user_config = config::get_user_config();
-    repair_codex_session_visibility_after_provider_change(
-        previous_history_provider,
-        next_history_provider,
-        &user_config,
-    );
-
-    let mut opencode_updated = false;
-    if user_config.opencode_auth_overwrite_on_switch {
-        match opencode_auth::replace_openai_entry_from_codex(&account) {
-            Ok(()) => {
-                opencode_updated = true;
-            }
-            Err(e) => {
-                logger::log_warn(&format!("OpenCode auth.json 更新跳过: {}", e));
-            }
-        }
-    } else {
-        logger::log_info("已关闭切换 Codex 时覆盖 OpenCode 登录信息");
-    }
-
-    if user_config.opencode_sync_on_switch {
-        if user_config.opencode_auth_overwrite_on_switch && opencode_updated {
-            if process::is_opencode_running() {
-                if let Err(e) = process::close_opencode(20) {
-                    logger::log_warn(&format!("OpenCode 关闭失败: {}", e));
-                }
-            } else {
-                logger::log_info("OpenCode 未在运行，准备启动");
-            }
-            if let Err(e) = process::start_opencode_with_path(Some(&user_config.opencode_app_path))
-            {
-                logger::log_warn(&format!("OpenCode 启动失败: {}", e));
-            }
-        } else if !user_config.opencode_auth_overwrite_on_switch {
-            logger::log_info("OpenCode 登录覆盖已关闭，跳过自动重启");
-        } else {
-            logger::log_info("OpenCode 未更新 auth.json，跳过启动/重启");
-        }
-    } else {
-        logger::log_info("已关闭 OpenCode 自动重启");
-    }
-
-    if user_config.openclaw_auth_overwrite_on_switch {
-        match openclaw_auth::replace_openai_codex_entry_from_codex(&account) {
-            Ok(()) => {}
-            Err(e) => {
-                logger::log_warn(&format!("OpenClaw auth 同步失败: {}", e));
-            }
-        }
-    } else {
-        logger::log_info("已关闭切换 Codex 时覆盖 OpenClaw 登录信息");
-    }
-
-    if user_config.codex_launch_on_switch {
+    if result.post_actions.codex_launch_on_switch {
+        let launch_started = Instant::now();
         #[cfg(target_os = "macos")]
         if process::is_codex_running() {
             logger::log_info("检测到 Codex 正在运行，将按默认实例 PID 逻辑重启");
         }
-        match crate::commands::codex_instance::codex_start_instance("__default__".to_string()).await
-        {
+        match crate::commands::codex_instance::codex_start_default_with_prepared_profile().await {
             Ok(_) => {}
             Err(e) => {
                 logger::log_warn(&format!("Codex 启动失败: {}", e));
@@ -356,14 +224,36 @@ pub async fn switch_codex_account(
                 }
             }
         }
+        logger::log_info(&format!(
+            "[Codex Switch][Backend] codex_start_default_with_prepared_profile finished: account_id={}, elapsed_ms={}, total_ms={}",
+            account_id,
+            launch_started.elapsed().as_millis(),
+            flow_started.elapsed().as_millis()
+        ));
     } else {
         logger::log_info("已关闭切换 Codex 时自动启动 Codex App");
     }
 
-    restart_codex_specified_app_if_enabled(&user_config);
+    if let Some(app_path) = result.post_actions.restart_specified_app_path.as_deref() {
+        let restart_specified_started = Instant::now();
+        restart_codex_specified_app_by_path(app_path);
+        logger::log_info(&format!(
+            "[Codex Switch][Backend] restart specified app post action finished: account_id={}, elapsed_ms={}, total_ms={}",
+            account_id,
+            restart_specified_started.elapsed().as_millis(),
+            flow_started.elapsed().as_millis()
+        ));
+    }
 
+    let tray_started = Instant::now();
     let _ = crate::modules::tray::update_tray_menu(&app);
-    Ok(account)
+    logger::log_info(&format!(
+        "[Codex Switch][Backend] switch_codex_account finished: account_id={}, tray_elapsed_ms={}, total_ms={}",
+        account_id,
+        tray_started.elapsed().as_millis(),
+        flow_started.elapsed().as_millis()
+    ));
+    Ok(result.account)
 }
 
 async fn run_codex_post_refresh_checks(app: &AppHandle) {
@@ -374,10 +264,13 @@ async fn run_codex_post_refresh_checks(app: &AppHandle) {
 
     let mut switched = false;
 
-    match codex_account::pick_auto_switch_target_if_needed() {
+    match platform_adapter::call_codex::<Option<CodexAccount>>(
+        "accounts.pickAutoSwitchTarget",
+        json!({}),
+    ) {
         Ok(Some(target)) => {
             let target_id = target.id.clone();
-            match switch_codex_account(app.clone(), target_id.clone()).await {
+            match switch_codex_account(app.clone(), target_id.clone(), None).await {
                 Ok(switched_account) => {
                     logger::log_info(&format!(
                         "[AutoSwitch][Codex] 自动切号完成: target_id={}, email={}",
@@ -400,8 +293,13 @@ async fn run_codex_post_refresh_checks(app: &AppHandle) {
     }
 
     if !switched {
-        if let Err(e) = codex_account::run_quota_alert_if_needed() {
-            logger::log_warn(&format!("[QuotaAlert][Codex] 预警检查失败: {}", e));
+        match platform_adapter::call_codex::<Option<crate::modules::quota_alert::QuotaAlertPayload>>(
+            "quota.alertPayload",
+            json!({}),
+        ) {
+            Ok(Some(payload)) => crate::modules::quota_alert::dispatch_quota_alert(&payload),
+            Ok(None) => {}
+            Err(e) => logger::log_warn(&format!("[QuotaAlert][Codex] 预警检查失败: {}", e)),
         }
     }
 
@@ -410,64 +308,26 @@ async fn run_codex_post_refresh_checks(app: &AppHandle) {
 
 /// 删除 Codex 账号
 #[tauri::command]
-pub fn delete_codex_account(account_id: String) -> Result<(), String> {
-    codex_account::remove_account(&account_id)
+pub async fn delete_codex_account(account_id: String) -> Result<(), String> {
+    platform_adapter::call_codex("accounts.delete", json!({ "accountId": account_id }))
 }
 
 /// 批量删除 Codex 账号
 #[tauri::command]
-pub fn delete_codex_accounts(account_ids: Vec<String>) -> Result<(), String> {
-    codex_account::remove_accounts(&account_ids)
-}
-
-async fn refresh_imported_codex_accounts(
-    app: &AppHandle,
-    accounts: Vec<CodexAccount>,
-) -> Vec<CodexAccount> {
-    let mut result = Vec::with_capacity(accounts.len());
-    let mut success_count = 0;
-    let mut attempted = false;
-
-    for account in accounts {
-        if account.is_api_key_auth() {
-            result.push(account);
-            continue;
-        }
-
-        attempted = true;
-        match codex_quota::refresh_account_quota(&account.id).await {
-            Ok(_) => {
-                success_count += 1;
-            }
-            Err(error) => {
-                logger::log_warn(&format!(
-                    "Codex 导入后刷新配额失败: account_id={}, email={}, error={}",
-                    account.id, account.email, error
-                ));
-            }
-        }
-
-        result.push(codex_account::load_account(&account.id).unwrap_or(account));
-    }
-
-    if success_count > 0 {
-        run_codex_post_refresh_checks(app).await;
-    }
-    if attempted || !result.is_empty() {
-        let _ = crate::modules::tray::update_tray_menu(app);
-    }
-
-    result
+pub async fn delete_codex_accounts(account_ids: Vec<String>) -> Result<(), String> {
+    platform_adapter::call_codex("accounts.deleteMany", json!({ "accountIds": account_ids }))
 }
 
 /// 从本地 auth.json 导入账号
 #[tauri::command]
 pub async fn import_codex_from_local(app: AppHandle) -> Result<CodexAccount, String> {
-    let account = codex_account::import_from_local()?;
-    let mut accounts = refresh_imported_codex_accounts(&app, vec![account]).await;
-    accounts
-        .pop()
-        .ok_or_else(|| "账号导入后无法读取".to_string())
+    let account: CodexAccount =
+        platform_adapter::call_codex("accounts.importFromLocal", json!({}))?;
+    if !account.is_api_key_auth() {
+        run_codex_post_refresh_checks(&app).await;
+    }
+    let _ = crate::modules::tray::update_tray_menu(&app);
+    Ok(account)
 }
 
 /// 从 JSON 字符串导入账号
@@ -476,14 +336,23 @@ pub async fn import_codex_from_json(
     app: AppHandle,
     json_content: String,
 ) -> Result<Vec<CodexAccount>, String> {
-    let accounts = codex_account::import_from_json(&json_content).await?;
-    Ok(refresh_imported_codex_accounts(&app, accounts).await)
+    let accounts: Vec<CodexAccount> = platform_adapter::call_codex(
+        "accounts.importFromJson",
+        json!({ "jsonContent": json_content }),
+    )?;
+    if accounts.iter().any(|account| !account.is_api_key_auth()) {
+        run_codex_post_refresh_checks(&app).await;
+    }
+    if !accounts.is_empty() {
+        let _ = crate::modules::tray::update_tray_menu(&app);
+    }
+    Ok(accounts)
 }
 
 /// 导出 Codex 账号
 #[tauri::command]
 pub fn export_codex_accounts(account_ids: Vec<String>) -> Result<String, String> {
-    codex_account::export_accounts(&account_ids)
+    platform_adapter::call_codex("accounts.export", json!({ "accountIds": account_ids }))
 }
 
 /// 从本地文件导入 Codex 账号
@@ -491,19 +360,81 @@ pub fn export_codex_accounts(account_ids: Vec<String>) -> Result<String, String>
 pub async fn import_codex_from_files(
     app: AppHandle,
     file_paths: Vec<String>,
-) -> Result<codex_account::CodexFileImportResult, String> {
-    let result = codex_account::import_from_files(file_paths).await?;
-    let imported = refresh_imported_codex_accounts(&app, result.imported).await;
-    Ok(codex_account::CodexFileImportResult {
-        imported,
-        failed: result.failed,
-    })
+) -> Result<CodexFileImportResult, String> {
+    let result: CodexFileImportResult = platform_adapter::call_codex(
+        "accounts.importFromFiles",
+        json!({ "filePaths": file_paths }),
+    )?;
+    if result
+        .imported
+        .iter()
+        .any(|account| !account.is_api_key_auth())
+    {
+        run_codex_post_refresh_checks(&app).await;
+    }
+    if !result.imported.is_empty() {
+        let _ = crate::modules::tray::update_tray_menu(&app);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn start_codex_batch_import_from_files(
+    _app: AppHandle,
+    file_paths: Vec<String>,
+    check_quota: bool,
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "accounts.batchImport.startFromFiles",
+        json!({
+            "filePaths": file_paths,
+            "checkQuota": check_quota,
+        }),
+    )
+}
+
+#[tauri::command]
+pub fn cancel_codex_batch_import(session_id: String) -> Result<(), String> {
+    platform_adapter::call_codex(
+        "accounts.batchImport.cancel",
+        json!({ "sessionId": session_id }),
+    )
+}
+
+#[tauri::command]
+pub fn resume_codex_batch_import(_app: AppHandle, session_id: String) -> Result<(), String> {
+    platform_adapter::call_codex(
+        "accounts.batchImport.resume",
+        json!({ "sessionId": session_id }),
+    )
+}
+
+#[tauri::command]
+pub fn get_codex_batch_import_preview(session_id: String) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "accounts.batchImport.preview",
+        json!({ "sessionId": session_id }),
+    )
+}
+
+#[tauri::command]
+pub fn confirm_codex_batch_import(
+    session_id: String,
+    item_ids: Vec<String>,
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "accounts.batchImport.confirm",
+        json!({
+            "sessionId": session_id,
+            "itemIds": item_ids,
+        }),
+    )
 }
 
 /// 刷新单个账号配额
 #[tauri::command]
 pub async fn refresh_codex_quota(app: AppHandle, account_id: String) -> Result<CodexQuota, String> {
-    let result = codex_quota::refresh_account_quota(&account_id).await;
+    let result = platform_adapter::call_codex("quota.refresh", json!({ "accountId": account_id }));
     if result.is_ok() {
         run_codex_post_refresh_checks(&app).await;
         let _ = crate::modules::tray::update_tray_menu(&app);
@@ -512,11 +443,61 @@ pub async fn refresh_codex_quota(app: AppHandle, account_id: String) -> Result<C
 }
 
 #[tauri::command]
+pub async fn get_codex_reset_credits(account_id: String) -> Result<Value, String> {
+    platform_adapter::call_codex("quota.resetCredits", json!({ "accountId": account_id }))
+}
+
+#[tauri::command]
+pub async fn consume_codex_reset_credit(account_id: String) -> Result<(), String> {
+    platform_adapter::call_codex(
+        "quota.consumeResetCredit",
+        json!({ "accountId": account_id }),
+    )
+}
+
+#[tauri::command]
+pub async fn get_codex_referral_invite_eligibility(
+    account_id: String,
+    referral_key: Option<String>,
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "quota.referralInviteEligibility",
+        json!({ "accountId": account_id, "referralKey": referral_key }),
+    )
+}
+
+#[tauri::command]
+pub async fn get_codex_referral_eligibility_rules(
+    account_id: String,
+    referral_key: Option<String>,
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "quota.referralEligibilityRules",
+        json!({ "accountId": account_id, "referralKey": referral_key }),
+    )
+}
+
+#[tauri::command]
+pub async fn send_codex_referral_invites(
+    account_id: String,
+    referral_key: Option<String>,
+    emails: Vec<String>,
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "quota.sendReferralInvites",
+        json!({ "accountId": account_id, "referralKey": referral_key, "emails": emails }),
+    )
+}
+
+#[tauri::command]
 pub async fn refresh_codex_subscription_info(
     app: AppHandle,
     account_id: String,
 ) -> Result<CodexAccount, String> {
-    let result = codex_quota::refresh_account_subscription_info(&account_id, true).await;
+    let result = platform_adapter::call_codex(
+        "quota.refreshSubscriptionInfo",
+        json!({ "accountId": account_id, "force": true }),
+    );
     if result.is_ok() {
         let _ = crate::modules::tray::update_tray_menu(&app);
     }
@@ -525,14 +506,8 @@ pub async fn refresh_codex_subscription_info(
 
 #[tauri::command]
 pub async fn refresh_current_codex_quota(app: AppHandle) -> Result<(), String> {
-    let Some(account) = codex_account::get_current_account() else {
-        return Err("未找到当前 Codex 账号".to_string());
-    };
-    if account.is_api_key_auth() {
-        return Ok(());
-    }
-
-    let result = codex_quota::refresh_account_quota(&account.id).await;
+    let result: Result<serde_json::Value, String> =
+        platform_adapter::call_codex("quota.refreshCurrent", json!({}));
     if result.is_ok() {
         run_codex_post_refresh_checks(&app).await;
         let _ = crate::modules::tray::update_tray_menu(&app);
@@ -547,7 +522,8 @@ pub async fn refresh_current_codex_quota(app: AppHandle) -> Result<(), String> {
 /// 刷新所有账号配额
 #[tauri::command]
 pub async fn refresh_all_codex_quotas(app: AppHandle) -> Result<i32, String> {
-    let results = codex_quota::refresh_all_quotas().await?;
+    let results: Vec<(String, Result<CodexQuota, String>)> =
+        platform_adapter::call_codex("quota.refreshAll", json!({}))?;
     let success_count = results.iter().filter(|(_, r)| r.is_ok()).count();
     if success_count > 0 {
         run_codex_post_refresh_checks(&app).await;
@@ -556,94 +532,43 @@ pub async fn refresh_all_codex_quotas(app: AppHandle) -> Result<i32, String> {
     Ok(success_count as i32)
 }
 
-async fn save_codex_oauth_tokens(tokens: CodexTokens) -> Result<CodexAccount, String> {
-    let account = codex_account::upsert_account(tokens)?;
-
-    if let Err(e) = codex_quota::refresh_account_quota(&account.id).await {
-        logger::log_error(&format!("刷新配额失败: {}", e));
-    }
-
-    let loaded =
-        codex_account::load_account(&account.id).ok_or_else(|| "账号保存后无法读取".to_string())?;
-    logger::log_info(&format!(
-        "Codex OAuth 账号已保存: account_id={}, email={}",
-        loaded.id, loaded.email
-    ));
-    Ok(loaded)
-}
-
 /// OAuth：开始登录（返回 loginId + authUrl）
 #[tauri::command]
-pub async fn codex_oauth_login_start(
-    app_handle: AppHandle,
-) -> Result<codex_oauth::CodexOAuthLoginStartResponse, String> {
-    logger::log_info("Codex OAuth start 命令触发");
-    let response = codex_oauth::start_oauth_login(app_handle).await?;
-    logger::log_info(&format!(
-        "Codex OAuth start 命令成功: login_id={}",
-        response.login_id
-    ));
-    Ok(response)
+pub async fn codex_oauth_login_start() -> Result<Value, String> {
+    platform_adapter::call_codex("oauth.start", json!({}))
 }
 
 /// OAuth：浏览器授权完成后按 loginId 完成登录
 #[tauri::command]
-pub async fn codex_oauth_login_completed(login_id: String) -> Result<CodexAccount, String> {
-    let started_at_ms = chrono::Utc::now().timestamp_millis();
-    logger::log_info(&format!(
-        "Codex OAuth completed 命令开始: login_id={}, started_at_ms={}",
-        login_id, started_at_ms
-    ));
-    let tokens = match codex_oauth::complete_oauth_login(&login_id).await {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            logger::log_error(&format!(
-                "Codex OAuth completed 命令失败: login_id={}, duration_ms={}, error={}",
-                login_id,
-                chrono::Utc::now().timestamp_millis() - started_at_ms,
-                e
-            ));
-            return Err(e);
-        }
-    };
-    let account = save_codex_oauth_tokens(tokens).await?;
-    logger::log_info(&format!(
-        "Codex OAuth completed 命令成功: login_id={}, duration_ms={}, account_id={}, account_email={}",
-        login_id,
-        chrono::Utc::now().timestamp_millis() - started_at_ms,
-        account.id,
-        account.email
-    ));
-    Ok(account)
+pub async fn codex_oauth_login_completed(
+    login_id: String,
+    reauth_account_id: Option<String>,
+) -> Result<CodexAccount, String> {
+    platform_adapter::call_codex(
+        "oauth.complete",
+        json!({
+            "loginId": login_id,
+            "reauthAccountId": reauth_account_id,
+        }),
+    )
 }
 
 /// OAuth：按 loginId 取消登录（login_id 为空时取消当前流程）
 #[tauri::command]
 pub fn codex_oauth_login_cancel(login_id: Option<String>) -> Result<(), String> {
-    logger::log_info(&format!(
-        "Codex OAuth cancel 命令触发: login_id={}",
-        login_id.as_deref().unwrap_or("<none>")
-    ));
-    let result = codex_oauth::cancel_oauth_flow_for(login_id.as_deref());
-    logger::log_info(&format!(
-        "Codex OAuth cancel 命令返回: {:?}",
-        result.as_ref().map(|_| "ok").map_err(|e| e)
-    ));
-    result
+    platform_adapter::call_codex("oauth.cancel", json!({ "loginId": login_id }))
 }
 
 /// OAuth：手动提交回调链接（用于本地端口不可达时）
 #[tauri::command]
 pub fn codex_oauth_submit_callback_url(
-    app_handle: AppHandle,
     login_id: String,
     callback_url: String,
 ) -> Result<(), String> {
-    codex_oauth::submit_callback_url(login_id.as_str(), callback_url.as_str())?;
-    let payload = serde_json::json!({ "loginId": login_id });
-    let _ = app_handle.emit("codex-oauth-login-completed", payload.clone());
-    let _ = app_handle.emit("ghcp-oauth-login-completed", payload);
-    Ok(())
+    platform_adapter::call_codex(
+        "oauth.submitCallbackUrl",
+        json!({ "loginId": login_id, "callbackUrl": callback_url }),
+    )
 }
 
 /// 通过 Token 添加账号
@@ -653,20 +578,14 @@ pub async fn add_codex_account_with_token(
     access_token: String,
     refresh_token: Option<String>,
 ) -> Result<CodexAccount, String> {
-    let tokens = CodexTokens {
-        id_token,
-        access_token,
-        refresh_token,
-    };
-
-    let account = codex_account::upsert_account(tokens)?;
-
-    // 刷新配额
-    if let Err(e) = codex_quota::refresh_account_quota(&account.id).await {
-        logger::log_error(&format!("刷新配额失败: {}", e));
-    }
-
-    codex_account::load_account(&account.id).ok_or_else(|| "账号保存后无法读取".to_string())
+    platform_adapter::call_codex(
+        "accounts.addToken",
+        json!({
+            "idToken": id_token,
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+        }),
+    )
 }
 
 /// 通过 API Key 添加账号
@@ -677,20 +596,37 @@ pub fn add_codex_account_with_api_key(
     api_provider_mode: Option<CodexApiProviderMode>,
     api_provider_id: Option<String>,
     api_provider_name: Option<String>,
+    api_model_catalog: Option<Vec<String>>,
+    api_wire_api: Option<String>,
+    api_supports_vision: Option<bool>,
+    api_model_vision_support: Option<std::collections::HashMap<String, bool>>,
+    api_vision_routing_model: Option<String>,
+    account_name: Option<String>,
 ) -> Result<CodexAccount, String> {
-    let account = codex_account::upsert_api_key_account(
-        api_key,
-        api_base_url,
-        api_provider_mode,
-        api_provider_id,
-        api_provider_name,
-    )?;
-    codex_account::load_account(&account.id).ok_or_else(|| "账号保存后无法读取".to_string())
+    platform_adapter::call_codex(
+        "accounts.addApiKey",
+        json!({
+            "apiKey": api_key,
+            "apiBaseUrl": api_base_url,
+            "apiProviderMode": api_provider_mode,
+            "apiProviderId": api_provider_id,
+            "apiProviderName": api_provider_name,
+            "apiModelCatalog": api_model_catalog,
+            "apiWireApi": api_wire_api,
+            "apiSupportsVision": api_supports_vision,
+            "apiModelVisionSupport": api_model_vision_support,
+            "apiVisionRoutingModel": api_vision_routing_model,
+            "accountName": account_name,
+        }),
+    )
 }
 
 #[tauri::command]
 pub fn update_codex_account_name(account_id: String, name: String) -> Result<CodexAccount, String> {
-    codex_account::update_account_name(&account_id, name)
+    platform_adapter::call_codex(
+        "accounts.updateName",
+        json!({ "accountId": account_id, "name": name }),
+    )
 }
 
 #[tauri::command]
@@ -701,14 +637,27 @@ pub fn update_codex_api_key_credentials(
     api_provider_mode: Option<CodexApiProviderMode>,
     api_provider_id: Option<String>,
     api_provider_name: Option<String>,
+    api_model_catalog: Option<Vec<String>>,
+    api_wire_api: Option<String>,
+    api_supports_vision: Option<bool>,
+    api_model_vision_support: Option<std::collections::HashMap<String, bool>>,
+    api_vision_routing_model: Option<String>,
 ) -> Result<CodexAccount, String> {
-    codex_account::update_api_key_credentials(
-        &account_id,
-        api_key,
-        api_base_url,
-        api_provider_mode,
-        api_provider_id,
-        api_provider_name,
+    platform_adapter::call_codex(
+        "accounts.updateApiKeyCredentials",
+        json!({
+            "accountId": account_id,
+            "apiKey": api_key,
+            "apiBaseUrl": api_base_url,
+            "apiProviderMode": api_provider_mode,
+            "apiProviderId": api_provider_id,
+            "apiProviderName": api_provider_name,
+            "apiModelCatalog": api_model_catalog,
+            "apiWireApi": api_wire_api,
+            "apiSupportsVision": api_supports_vision,
+            "apiModelVisionSupport": api_model_vision_support,
+            "apiVisionRoutingModel": api_vision_routing_model,
+        }),
     )
 }
 
@@ -716,8 +665,16 @@ pub fn update_codex_api_key_credentials(
 pub async fn update_codex_api_key_bound_oauth_account(
     account_id: String,
     bound_oauth_account_id: Option<String>,
+    bound_oauth_use_local_gateway: Option<bool>,
 ) -> Result<CodexAccount, String> {
-    codex_account::update_api_key_bound_oauth_account(&account_id, bound_oauth_account_id).await
+    platform_adapter::call_codex(
+        "accounts.updateApiKeyBoundOAuthAccount",
+        json!({
+            "accountId": account_id,
+            "boundOauthAccountId": bound_oauth_account_id,
+            "boundOauthUseLocalGateway": bound_oauth_use_local_gateway,
+        }),
+    )
 }
 
 #[tauri::command]
@@ -725,7 +682,10 @@ pub async fn update_codex_account_tags(
     account_id: String,
     tags: Vec<String>,
 ) -> Result<CodexAccount, String> {
-    codex_account::update_account_tags(&account_id, tags)
+    platform_adapter::call_codex(
+        "accounts.updateTags",
+        json!({ "accountId": account_id, "tags": tags }),
+    )
 }
 
 #[tauri::command]
@@ -733,89 +693,104 @@ pub async fn update_codex_account_note(
     account_id: String,
     note: String,
 ) -> Result<CodexAccount, String> {
-    codex_account::update_account_note(&account_id, note)
+    platform_adapter::call_codex(
+        "accounts.updateNote",
+        json!({ "accountId": account_id, "note": note }),
+    )
 }
 
 /// 检查 Codex OAuth 端口是否被占用
 #[tauri::command]
 pub fn is_codex_oauth_port_in_use() -> Result<bool, String> {
-    let port = codex_oauth::get_callback_port();
-    process::is_port_in_use(port)
+    platform_adapter::call_codex("oauth.isPortInUse", json!({}))
 }
 
 /// 关闭占用 Codex OAuth 端口的进程
 #[tauri::command]
 pub fn close_codex_oauth_port() -> Result<u32, String> {
-    let port = codex_oauth::get_callback_port();
-    let killed = process::kill_port_processes(port)?;
-    Ok(killed as u32)
+    platform_adapter::call_codex("oauth.closePortProcess", json!({}))
 }
 
 #[tauri::command]
-pub fn codex_wakeup_get_cli_status() -> Result<codex_wakeup::CodexCliStatus, String> {
-    Ok(codex_wakeup::get_cli_status())
+pub fn codex_wakeup_get_cli_status() -> Result<Value, String> {
+    platform_adapter::call_codex("wakeup.getCliStatus", json!({}))
 }
 
 #[tauri::command]
 pub fn codex_wakeup_update_runtime_config(
     codex_cli_path: Option<String>,
     node_path: Option<String>,
-) -> Result<codex_wakeup::CodexCliStatus, String> {
-    codex_wakeup::save_runtime_config(&codex_wakeup::CodexWakeupRuntimeConfig {
-        codex_cli_path,
-        node_path,
-    })?;
-    Ok(codex_wakeup::get_cli_status())
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "wakeup.updateRuntimeConfig",
+        json!({
+            "codexCliPath": codex_cli_path,
+            "nodePath": node_path,
+        }),
+    )
 }
 
 #[tauri::command]
-pub fn codex_wakeup_get_overview() -> Result<codex_wakeup::CodexWakeupOverview, String> {
-    codex_wakeup::load_overview()
+pub fn codex_wakeup_get_overview() -> Result<Value, String> {
+    platform_adapter::call_codex_with_timeout(
+        "wakeup.getOverview",
+        json!({}),
+        CODEX_FAST_READ_TIMEOUT,
+    )
 }
 
 #[tauri::command]
-pub fn codex_wakeup_get_state() -> Result<codex_wakeup::CodexWakeupState, String> {
-    codex_wakeup::load_state()
+pub fn codex_wakeup_get_state() -> Result<Value, String> {
+    platform_adapter::call_codex_with_timeout("wakeup.getState", json!({}), CODEX_FAST_READ_TIMEOUT)
 }
 
 #[tauri::command]
 pub fn codex_wakeup_save_state(
     enabled: bool,
-    tasks: Vec<codex_wakeup::CodexWakeupTask>,
-    model_presets: Vec<codex_wakeup::CodexWakeupModelPreset>,
+    tasks: Vec<Value>,
+    model_presets: Vec<Value>,
     model_preset_migrations: Vec<String>,
-) -> Result<codex_wakeup::CodexWakeupState, String> {
-    codex_wakeup::save_state(&codex_wakeup::CodexWakeupState {
-        enabled,
-        tasks,
-        model_presets,
-        model_preset_migrations,
-    })
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "wakeup.saveState",
+        json!({
+            "enabled": enabled,
+            "tasks": tasks,
+            "modelPresets": model_presets,
+            "modelPresetMigrations": model_preset_migrations,
+        }),
+    )
 }
 
 #[tauri::command]
-pub fn codex_wakeup_load_history() -> Result<Vec<codex_wakeup::CodexWakeupHistoryItem>, String> {
-    codex_wakeup::load_history()
+pub fn codex_wakeup_load_history() -> Result<Value, String> {
+    platform_adapter::call_codex("wakeup.loadHistory", json!({}))
 }
 
 #[tauri::command]
 pub fn codex_wakeup_clear_history() -> Result<(), String> {
-    codex_wakeup::clear_history()
+    platform_adapter::call_codex("wakeup.clearHistory", json!({}))
 }
 
 #[tauri::command]
 pub fn codex_wakeup_cancel_scope(cancel_scope_id: String) -> Result<(), String> {
-    codex_wakeup::cancel_wakeup_scope(&cancel_scope_id)
+    platform_adapter::call_codex(
+        "wakeup.cancelScope",
+        json!({ "cancelScopeId": cancel_scope_id }),
+    )
 }
 
 #[tauri::command]
 pub fn codex_wakeup_release_scope(cancel_scope_id: String) -> Result<(), String> {
-    codex_wakeup::release_wakeup_scope(&cancel_scope_id)
+    platform_adapter::call_codex(
+        "wakeup.releaseScope",
+        json!({ "cancelScopeId": cancel_scope_id }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_wakeup_test(
-    app: AppHandle,
+    _app: AppHandle,
     account_ids: Vec<String>,
     prompt: Option<String>,
     model: Option<String>,
@@ -823,92 +798,232 @@ pub async fn codex_wakeup_test(
     model_reasoning_effort: Option<String>,
     run_id: Option<String>,
     cancel_scope_id: Option<String>,
-) -> Result<codex_wakeup::CodexWakeupBatchResult, String> {
-    codex_wakeup::run_batch(
-        Some(&app),
-        account_ids,
-        prompt,
-        codex_wakeup::CodexWakeupExecutionConfig {
-            model,
-            model_display_name,
-            model_reasoning_effort,
-        },
-        codex_wakeup::TaskRunContext {
-            trigger_type: "test".to_string(),
-            task_id: None,
-            task_name: None,
-        },
-        run_id,
-        cancel_scope_id.as_deref(),
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "wakeup.test",
+        json!({
+            "accountIds": account_ids,
+            "prompt": prompt,
+            "model": model,
+            "modelDisplayName": model_display_name,
+            "modelReasoningEffort": model_reasoning_effort,
+            "runId": run_id,
+            "cancelScopeId": cancel_scope_id,
+        }),
     )
-    .await
 }
 
 #[tauri::command]
 pub async fn codex_wakeup_run_task(
-    app: AppHandle,
+    _app: AppHandle,
     task_id: String,
     run_id: Option<String>,
-) -> Result<codex_wakeup::CodexWakeupBatchResult, String> {
-    codex_wakeup_scheduler::run_task_now(Some(&app), &task_id, "manual_task", run_id).await
+) -> Result<Value, String> {
+    platform_adapter::call_codex(
+        "wakeup.runTask",
+        json!({
+            "taskId": task_id,
+            "runId": run_id,
+        }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_wakeup_run_enabled_tasks(
-    app: AppHandle,
+    _app: AppHandle,
     trigger_type: Option<String>,
 ) -> Result<u32, String> {
-    let trigger = trigger_type.unwrap_or_else(|| "startup".to_string());
-    codex_wakeup_scheduler::run_enabled_tasks_now(Some(&app), &trigger).await
+    platform_adapter::call_codex(
+        "wakeup.runEnabledTasks",
+        json!({ "triggerType": trigger_type }),
+    )
 }
 
 // ─── Codex 账号分组持久化 ────────────────────────────────────────────
 
-const CODEX_GROUPS_FILE: &str = "codex_account_groups.json";
-const CODEX_MODEL_PROVIDERS_FILE: &str = "codex_model_providers.json";
-
 #[tauri::command]
 pub async fn load_codex_account_groups() -> Result<String, String> {
-    let path = account::get_data_dir()?.join(CODEX_GROUPS_FILE);
-    if !path.exists() {
-        return Ok("[]".to_string());
-    }
-    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read codex groups: {}", e))
+    platform_adapter::call_codex("accounts.loadGroups", json!({}))
 }
 
 #[tauri::command]
 pub async fn save_codex_account_groups(data: String) -> Result<(), String> {
-    let dir = account::get_data_dir()?;
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create dir: {}", e))?;
-    }
-    let path = dir.join(CODEX_GROUPS_FILE);
-    std::fs::write(&path, data).map_err(|e| format!("Failed to write codex groups: {}", e))
+    platform_adapter::call_codex("accounts.saveGroups", json!({ "data": data }))
 }
 
 #[tauri::command]
 pub async fn load_codex_model_providers() -> Result<String, String> {
-    let path = account::get_data_dir()?.join(CODEX_MODEL_PROVIDERS_FILE);
-    if !path.exists() {
-        return Ok("[]".to_string());
-    }
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read codex model providers: {}", e))
+    platform_adapter::call_codex_with_timeout(
+        "modelProviders.load",
+        json!({}),
+        CODEX_FAST_READ_TIMEOUT,
+    )
 }
 
 #[tauri::command]
 pub async fn save_codex_model_providers(data: String) -> Result<(), String> {
-    let dir = account::get_data_dir()?;
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create dir: {}", e))?;
-    }
-    let path = dir.join(CODEX_MODEL_PROVIDERS_FILE);
-    std::fs::write(&path, data).map_err(|e| format!("Failed to write codex model providers: {}", e))
+    platform_adapter::call_codex_with_timeout(
+        "modelProviders.save",
+        json!({ "data": data }),
+        CODEX_LOCAL_ACCESS_FAST_MUTATION_TIMEOUT,
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderChatTestTarget {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub base_url: String,
+    pub api_key_id: Option<String>,
+    pub api_key_name: Option<String>,
+    pub api_key: String,
+    pub wire_api: Option<String>,
+    #[serde(default)]
+    pub model_catalog: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderChatTestRecord {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub api_key_id: Option<String>,
+    pub api_key_name: Option<String>,
+    pub wire_api: String,
+    pub access_mode: String,
+    pub model_id: Option<String>,
+    pub success: bool,
+    pub prompt: String,
+    pub reply: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderChatTestBatchResult {
+    pub run_id: String,
+    pub records: Vec<CodexModelProviderChatTestRecord>,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderUsageDetail {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderModel {
+    pub id: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderModelsResult {
+    pub models: Vec<CodexModelProviderModel>,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelProviderUsageSummary {
+    pub mode: Option<String>,
+    pub is_valid: Option<bool>,
+    pub status: Option<String>,
+    pub plan_name: Option<String>,
+    pub remaining: Option<f64>,
+    pub balance: Option<f64>,
+    pub unit: Option<String>,
+    pub quota_unlimited: Option<bool>,
+    pub quota_limit: Option<f64>,
+    pub quota_used: Option<f64>,
+    pub quota_remaining: Option<f64>,
+    pub today_requests: Option<i64>,
+    pub today_total_tokens: Option<i64>,
+    pub today_cost: Option<f64>,
+    pub total_requests: Option<i64>,
+    pub total_total_tokens: Option<i64>,
+    pub total_cost: Option<f64>,
+    pub model_stats_count: usize,
+    pub latency_ms: u64,
+    pub details: Vec<CodexModelProviderUsageDetail>,
+}
+
+#[tauri::command]
+pub async fn codex_test_model_provider_connection(
+    base_url: String,
+    api_key: String,
+    wire_api: Option<String>,
+) -> Result<CodexLocalAccessTestResult, String> {
+    platform_adapter::call_codex(
+        "modelProviders.testConnection",
+        json!({
+            "baseUrl": base_url,
+            "apiKey": api_key,
+            "wireApi": wire_api,
+        }),
+    )
+}
+
+#[tauri::command]
+pub async fn codex_model_provider_chat_test_batch(
+    targets: Vec<CodexModelProviderChatTestTarget>,
+    prompt: Option<String>,
+    model: Option<String>,
+    run_id: Option<String>,
+) -> Result<CodexModelProviderChatTestBatchResult, String> {
+    platform_adapter::call_codex(
+        "modelProviders.chatTestBatch",
+        json!({
+            "targets": targets,
+            "prompt": prompt,
+            "model": model,
+            "runId": run_id,
+        }),
+    )
+}
+
+#[tauri::command]
+pub async fn codex_list_model_provider_models(
+    base_url: String,
+    api_key: String,
+) -> Result<CodexModelProviderModelsResult, String> {
+    platform_adapter::call_codex(
+        "modelProviders.listModels",
+        json!({
+            "baseUrl": base_url,
+            "apiKey": api_key,
+        }),
+    )
+}
+
+#[tauri::command]
+pub async fn codex_query_model_provider_usage(
+    base_url: String,
+    api_key: String,
+    integration_type: Option<String>,
+) -> Result<CodexModelProviderUsageSummary, String> {
+    platform_adapter::call_codex(
+        "modelProviders.queryUsage",
+        json!({
+            "baseUrl": base_url,
+            "apiKey": api_key,
+            "integrationType": integration_type,
+        }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_get_state() -> Result<CodexLocalAccessState, String> {
-    codex_local_access::get_local_access_state().await
+    platform_adapter::call_codex("localAccess.getState", json!({}))
 }
 
 #[tauri::command]
@@ -916,35 +1031,47 @@ pub async fn codex_local_access_save_accounts(
     account_ids: Vec<String>,
     restrict_free_accounts: Option<bool>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::save_local_access_accounts(
-        account_ids,
-        restrict_free_accounts.unwrap_or(true),
+    call_codex_local_access_fast(
+        "localAccess.saveAccounts",
+        json!({
+            "accountIds": account_ids,
+            "restrictFreeAccounts": restrict_free_accounts,
+        }),
     )
-    .await
 }
 
 #[tauri::command]
 pub async fn codex_local_access_remove_account(
     account_id: String,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::remove_local_access_account(&account_id).await
+    call_codex_local_access_fast(
+        "localAccess.removeAccount",
+        json!({ "accountId": account_id }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_rotate_api_key() -> Result<CodexLocalAccessState, String> {
-    codex_local_access::rotate_local_access_api_key().await
+    call_codex_local_access_fast("localAccess.rotateApiKey", json!({}))
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_bound_oauth_account(
     bound_oauth_account_id: Option<String>,
+    bound_oauth_use_local_gateway: Option<bool>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_bound_oauth_account(bound_oauth_account_id).await
+    call_codex_local_access_fast(
+        "localAccess.updateBoundOAuthAccount",
+        json!({
+            "boundOauthAccountId": bound_oauth_account_id,
+            "boundOauthUseLocalGateway": bound_oauth_use_local_gateway,
+        }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_clear_stats() -> Result<CodexLocalAccessState, String> {
-    codex_local_access::clear_local_access_stats().await
+    call_codex_local_access_fast("localAccess.clearStats", json!({}))
 }
 
 #[tauri::command]
@@ -960,48 +1087,63 @@ pub async fn codex_local_access_query_request_logs(
     success: Option<bool>,
     error_category: Option<String>,
 ) -> Result<CodexLocalAccessUsageEventPage, String> {
-    codex_local_access::query_local_access_usage_events(
-        page,
-        page_size,
-        stats_range,
-        model_query,
-        account_query,
-        api_key_query,
-        gateway_mode,
-        request_kind,
-        success,
-        error_category,
+    platform_adapter::call_codex(
+        "localAccess.queryRequestLogs",
+        json!({
+            "page": page,
+            "pageSize": page_size,
+            "statsRange": stats_range,
+            "modelQuery": model_query,
+            "accountQuery": account_query,
+            "apiKeyQuery": api_key_query,
+            "gatewayMode": gateway_mode,
+            "requestKind": request_kind,
+            "success": success,
+            "errorCategory": error_category,
+        }),
     )
-    .await
 }
 
 #[tauri::command]
 pub async fn codex_local_access_prepare_restart() -> Result<CodexLocalAccessState, String> {
-    codex_local_access::prepare_local_access_gateway_for_restart().await
+    call_codex_local_access_fast("localAccess.prepareRestart", json!({}))
 }
 
 #[tauri::command]
 pub async fn codex_local_access_kill_port() -> Result<CodexLocalAccessPortCleanupResult, String> {
-    codex_local_access::kill_local_access_port_processes().await
+    call_codex_local_access_fast("localAccess.killPort", json!({}))
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_port(port: u16) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_port(port).await
+    call_codex_local_access_fast("localAccess.updatePort", json!({ "port": port }))
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_routing_strategy(
     strategy: CodexLocalAccessRoutingStrategy,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_routing_strategy(strategy).await
+    call_codex_local_access_fast(
+        "localAccess.updateRoutingStrategy",
+        json!({ "strategy": strategy }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_custom_routing(
     rules: Vec<CodexLocalAccessCustomRoutingRule>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_custom_routing(rules).await
+    call_codex_local_access_fast("localAccess.updateCustomRouting", json!({ "rules": rules }))
+}
+
+#[tauri::command]
+pub async fn codex_local_access_update_account_model_rules(
+    rules: Vec<CodexLocalAccessAccountModelRule>,
+) -> Result<CodexLocalAccessState, String> {
+    call_codex_local_access_fast(
+        "localAccess.updateAccountModelRules",
+        json!({ "rules": rules }),
+    )
 }
 
 #[tauri::command]
@@ -1009,14 +1151,23 @@ pub async fn codex_local_access_update_model_rules(
     model_aliases: Vec<CodexLocalAccessModelAlias>,
     excluded_models: Vec<String>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_model_rules(model_aliases, excluded_models).await
+    call_codex_local_access_fast(
+        "localAccess.updateModelRules",
+        json!({
+            "modelAliases": model_aliases,
+            "excludedModels": excluded_models,
+        }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_model_pricings(
     model_pricings: Vec<CodexLocalAccessModelPricing>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_model_pricings(model_pricings).await
+    call_codex_local_access_fast(
+        "localAccess.updateModelPricings",
+        json!({ "modelPricings": model_pricings }),
+    )
 }
 
 #[tauri::command]
@@ -1027,56 +1178,111 @@ pub async fn codex_local_access_update_routing_options(
     max_retry_interval_ms: u64,
     disable_cooling: bool,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_routing_options(
-        session_affinity,
-        session_affinity_ttl_ms,
-        max_retry_credentials,
-        max_retry_interval_ms,
-        disable_cooling,
+    call_codex_local_access_fast(
+        "localAccess.updateRoutingOptions",
+        json!({
+            "sessionAffinity": session_affinity,
+            "sessionAffinityTtlMs": session_affinity_ttl_ms,
+            "maxRetryCredentials": max_retry_credentials,
+            "maxRetryIntervalMs": max_retry_interval_ms,
+            "disableCooling": disable_cooling,
+        }),
     )
-    .await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_update_timeouts(
+    timeouts: CodexLocalAccessTimeouts,
+    active_timeout_preset_id: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    call_codex_local_access_fast(
+        "localAccess.updateTimeouts",
+        json!({
+            "timeouts": timeouts,
+            "activeTimeoutPresetId": active_timeout_preset_id,
+        }),
+    )
+}
+
+#[tauri::command]
+pub async fn codex_local_access_update_timeout_presets(
+    timeout_presets: Vec<CodexLocalAccessTimeoutPreset>,
+    active_timeout_preset_id: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    call_codex_local_access_fast(
+        "localAccess.updateTimeoutPresets",
+        json!({
+            "timeoutPresets": timeout_presets,
+            "activeTimeoutPresetId": active_timeout_preset_id,
+        }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_upstream_proxy_config(
     upstream_proxy_url: Option<String>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_upstream_proxy_config(upstream_proxy_url).await
+    call_codex_local_access_fast(
+        "localAccess.updateUpstreamProxyConfig",
+        json!({ "upstreamProxyUrl": upstream_proxy_url }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_gateway_mode(
     gateway_mode: CodexLocalAccessGatewayMode,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_gateway_mode(gateway_mode).await
+    call_codex_local_access_fast(
+        "localAccess.updateGatewayMode",
+        json!({ "gatewayMode": gateway_mode }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_debug_logs(
     debug_logs: bool,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_debug_logs(debug_logs).await
+    call_codex_local_access_fast(
+        "localAccess.updateDebugLogs",
+        json!({ "debugLogs": debug_logs }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_access_scope(
     access_scope: CodexLocalAccessScope,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_scope(access_scope).await
+    call_codex_local_access_fast(
+        "localAccess.updateAccessScope",
+        json!({ "accessScope": access_scope }),
+    )
+}
+
+#[tauri::command]
+pub async fn codex_local_access_update_client_base_url_host(
+    client_base_url_host: CodexLocalAccessClientBaseUrlHost,
+) -> Result<CodexLocalAccessState, String> {
+    call_codex_local_access_fast(
+        "localAccess.updateClientBaseUrlHost",
+        json!({ "clientBaseUrlHost": client_base_url_host }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_image_generation_mode(
     image_generation_mode: crate::models::codex_local_access::CodexLocalAccessImageGenerationMode,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_image_generation_mode(image_generation_mode).await
+    call_codex_local_access_fast(
+        "localAccess.updateImageGenerationMode",
+        json!({ "imageGenerationMode": image_generation_mode }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_create_api_key(
     label: Option<String>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::create_local_access_api_key(label).await
+    call_codex_local_access_fast("localAccess.createApiKey", json!({ "label": label }))
 }
 
 #[tauri::command]
@@ -1088,83 +1294,78 @@ pub async fn codex_local_access_update_api_key(
     allowed_models: Option<Vec<String>>,
     excluded_models: Option<Vec<String>>,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_api_key(
-        api_key_id,
-        label,
-        enabled,
-        model_prefix,
-        allowed_models,
-        excluded_models,
+    call_codex_local_access_fast(
+        "localAccess.updateApiKey",
+        json!({
+            "apiKeyId": api_key_id,
+            "label": label,
+            "enabled": enabled,
+            "modelPrefix": model_prefix,
+            "allowedModels": allowed_models,
+            "excludedModels": excluded_models,
+        }),
     )
-    .await
 }
 
 #[tauri::command]
 pub async fn codex_local_access_rotate_named_api_key(
     api_key_id: String,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::rotate_local_access_named_api_key(api_key_id).await
+    call_codex_local_access_fast(
+        "localAccess.rotateNamedApiKey",
+        json!({ "apiKeyId": api_key_id }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_delete_api_key(
     api_key_id: String,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::delete_local_access_api_key(api_key_id).await
+    call_codex_local_access_fast(
+        "localAccess.deleteApiKey",
+        json!({ "apiKeyId": api_key_id }),
+    )
 }
 
 #[tauri::command]
 pub async fn codex_local_access_set_enabled(
     enabled: bool,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::set_local_access_enabled(enabled).await
+    call_codex_local_access_fast("localAccess.setEnabled", json!({ "enabled": enabled }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLocalAccessActivateResult {
+    state: CodexLocalAccessState,
+    launch_on_switch: bool,
 }
 
 #[tauri::command]
-pub async fn codex_local_access_activate(app: AppHandle) -> Result<CodexLocalAccessState, String> {
-    let previous_history_provider = read_default_codex_history_provider_for_switch();
-    let codex_home = codex_account::get_codex_home();
-    let state = codex_local_access::activate_local_access_for_dir(&codex_home).await?;
-    let next_history_provider = read_default_codex_history_provider_for_switch();
-    let api_service_speed = codex_speed::get_api_service_app_speed_config()?.speed;
-    codex_speed::write_official_app_speed(api_service_speed.clone())?;
+pub async fn codex_local_access_activate(
+    app: AppHandle,
+    auto_repair_mode: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    let flow_started = Instant::now();
+    logger::log_info("[Codex API Service Switch][Backend] codex_local_access_activate started");
+    let activate_started = Instant::now();
+    let result: CodexLocalAccessActivateResult = platform_adapter::call_codex(
+        "localAccess.activate",
+        json!({ "autoRepairMode": auto_repair_mode }),
+    )?;
+    logger::log_info(&format!(
+        "[Codex API Service Switch][Backend] localAccess.activate adapter finished: elapsed_ms={}, total_ms={}",
+        activate_started.elapsed().as_millis(),
+        flow_started.elapsed().as_millis()
+    ));
 
-    let mut index = codex_account::load_account_index();
-    index.current_account_id = None;
-    codex_account::save_account_index(&index)?;
-
-    if let Err(e) = crate::modules::codex_instance::update_default_settings(
-        Some(Some(
-            crate::modules::codex_instance::CODEX_API_SERVICE_BIND_ACCOUNT_ID.to_string(),
-        )),
-        None,
-        Some(false),
-        None,
-    ) {
-        logger::log_warn(&format!("更新 Codex 默认实例为 API 服务模式失败: {}", e));
-    } else {
-        logger::log_info("已同步更新 Codex 默认实例为 API 服务模式");
-    }
-    if let Err(e) = crate::modules::codex_instance::update_default_app_speed(api_service_speed) {
-        logger::log_warn(&format!("更新 Codex 默认实例 API 服务速度失败: {}", e));
-    }
-
-    let user_config = config::get_user_config();
-    repair_codex_session_visibility_after_provider_change(
-        previous_history_provider,
-        next_history_provider,
-        &user_config,
-    );
-
-    logger::log_info("API 服务启动模式下跳过 OpenCode / OpenClaw OAuth 同步");
-
-    if user_config.codex_launch_on_switch {
+    if result.launch_on_switch {
+        let launch_started = Instant::now();
         #[cfg(target_os = "macos")]
         if process::is_codex_running() {
             logger::log_info("检测到 Codex 正在运行，将按默认实例 PID 逻辑重启");
         }
-        match crate::commands::codex_instance::codex_start_instance("__default__".to_string()).await
-        {
+        match crate::commands::codex_instance::codex_start_default_with_prepared_profile().await {
             Ok(_) => {}
             Err(e) => {
                 logger::log_warn(&format!("Codex 启动失败: {}", e));
@@ -1176,38 +1377,56 @@ pub async fn codex_local_access_activate(app: AppHandle) -> Result<CodexLocalAcc
                 }
             }
         }
+        logger::log_info(&format!(
+            "[Codex API Service Switch][Backend] codex_start_default_with_prepared_profile finished: elapsed_ms={}, total_ms={}",
+            launch_started.elapsed().as_millis(),
+            flow_started.elapsed().as_millis()
+        ));
     } else {
         logger::log_info("已关闭切换 Codex 时自动启动 Codex App");
     }
 
+    let tray_started = Instant::now();
     let _ = crate::modules::tray::update_tray_menu(&app);
-    Ok(state)
+    logger::log_info(&format!(
+        "[Codex API Service Switch][Backend] codex_local_access_activate finished: tray_elapsed_ms={}, total_ms={}",
+        tray_started.elapsed().as_millis(),
+        flow_started.elapsed().as_millis()
+    ));
+    Ok(result.state)
 }
 
 #[tauri::command]
 pub async fn codex_local_access_test() -> Result<CodexLocalAccessTestResult, String> {
-    codex_local_access::test_local_access_with_cli().await
+    platform_adapter::call_codex("localAccess.test", json!({}))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::codex_history_provider_changed;
+#[tauri::command]
+pub async fn codex_local_access_chat_test(
+    model_id: String,
+    messages: Vec<CodexLocalAccessChatMessage>,
+) -> Result<CodexLocalAccessChatResult, String> {
+    platform_adapter::call_codex(
+        "localAccess.chatTest",
+        json!({
+            "modelId": model_id,
+            "messages": messages,
+        }),
+    )
+}
 
-    #[test]
-    fn codex_history_provider_changed_only_when_both_known_and_different() {
-        assert!(codex_history_provider_changed(
-            Some("openai"),
-            Some("codex_local_access")
-        ));
-        assert!(codex_history_provider_changed(
-            Some("codex_local_access"),
-            Some("openai")
-        ));
-        assert!(!codex_history_provider_changed(
-            Some("codex_local_access"),
-            Some("codex_local_access")
-        ));
-        assert!(!codex_history_provider_changed(None, Some("openai")));
-        assert!(!codex_history_provider_changed(Some("openai"), None));
-    }
+#[tauri::command]
+pub async fn codex_local_access_chat_test_stream(
+    session_id: String,
+    model_id: String,
+    messages: Vec<CodexLocalAccessChatMessage>,
+) -> Result<(), String> {
+    platform_adapter::call_codex(
+        "localAccess.chatTestStream",
+        json!({
+            "sessionId": session_id,
+            "modelId": model_id,
+            "messages": messages,
+        }),
+    )
 }

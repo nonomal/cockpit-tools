@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "macos"))]
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
@@ -162,6 +164,7 @@ pub fn apply_tray_icon_style<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<()
 pub(crate) enum PlatformId {
     Antigravity,
     Codex,
+    Claude,
     Zed,
     GitHubCopilot,
     Windsurf,
@@ -175,11 +178,17 @@ pub(crate) enum PlatformId {
     Workbuddy,
 }
 
+fn is_antigravity_series_runtime_ready() -> bool {
+    crate::modules::platform_package::is_platform_package_runtime_ready("antigravity")
+        || crate::modules::platform_package::is_platform_package_runtime_ready("antigravity_ide")
+}
+
 impl PlatformId {
-    pub(crate) fn default_order() -> [Self; 13] {
+    pub(crate) fn default_order() -> [Self; 14] {
         [
-            Self::Antigravity,
+            Self::Claude,
             Self::Codex,
+            Self::Antigravity,
             Self::Zed,
             Self::GitHubCopilot,
             Self::Windsurf,
@@ -198,6 +207,7 @@ impl PlatformId {
         match value {
             crate::modules::tray_layout::PLATFORM_ANTIGRAVITY => Some(Self::Antigravity),
             crate::modules::tray_layout::PLATFORM_CODEX => Some(Self::Codex),
+            crate::modules::tray_layout::PLATFORM_CLAUDE_MANAGER => Some(Self::Claude),
             crate::modules::tray_layout::PLATFORM_ZED => Some(Self::Zed),
             crate::modules::tray_layout::PLATFORM_GITHUB_COPILOT => Some(Self::GitHubCopilot),
             crate::modules::tray_layout::PLATFORM_WINDSURF => Some(Self::Windsurf),
@@ -217,6 +227,7 @@ impl PlatformId {
         match self {
             Self::Antigravity => crate::modules::tray_layout::PLATFORM_ANTIGRAVITY,
             Self::Codex => crate::modules::tray_layout::PLATFORM_CODEX,
+            Self::Claude => crate::modules::tray_layout::PLATFORM_CLAUDE_MANAGER,
             Self::Zed => crate::modules::tray_layout::PLATFORM_ZED,
             Self::GitHubCopilot => crate::modules::tray_layout::PLATFORM_GITHUB_COPILOT,
             Self::Windsurf => crate::modules::tray_layout::PLATFORM_WINDSURF,
@@ -235,6 +246,7 @@ impl PlatformId {
         match self {
             Self::Antigravity => "Antigravity IDE",
             Self::Codex => "Codex",
+            Self::Claude => "Claude",
             Self::Zed => "Zed",
             Self::GitHubCopilot => "GitHub Copilot",
             Self::Windsurf => "Windsurf",
@@ -253,6 +265,7 @@ impl PlatformId {
         match self {
             Self::Antigravity => "overview",
             Self::Codex => "codex",
+            Self::Claude => "claude",
             Self::Zed => "zed",
             Self::GitHubCopilot => "github-copilot",
             Self::Windsurf => "windsurf",
@@ -264,6 +277,13 @@ impl PlatformId {
             Self::Qoder => "qoder",
             Self::Trae => "trae",
             Self::Workbuddy => "workbuddy",
+        }
+    }
+
+    pub(crate) fn runtime_ready(self) -> bool {
+        match self {
+            Self::Antigravity => is_antigravity_series_runtime_ready(),
+            _ => crate::modules::platform_package::is_platform_package_runtime_ready(self.as_str()),
         }
     }
 }
@@ -742,25 +762,36 @@ fn build_platform_details_submenu<R: Runtime>(
     platform: PlatformId,
     lang: &str,
 ) -> Result<Submenu<R>, tauri::Error> {
-    let info = get_account_display_info(platform, lang);
     let mut items: Vec<MenuItem<R>> = Vec::new();
 
-    items.push(MenuItem::with_id(
-        app,
-        format!("platform:{}:account", platform.as_str()),
-        info.account,
-        true,
-        None::<&str>,
-    )?);
-
-    for (idx, line) in info.quota_lines.iter().enumerate() {
+    if !platform.runtime_ready() {
         items.push(MenuItem::with_id(
             app,
-            format!("platform:{}:quota:{}", platform.as_str(), idx),
-            line,
+            format!("platform:{}:install", platform.as_str()),
+            crate::modules::i18n::translate(lang, "platformLayout.packageInstallAndOpen", &[]),
             true,
             None::<&str>,
         )?);
+    } else {
+        let info = get_account_display_info(platform, lang);
+
+        items.push(MenuItem::with_id(
+            app,
+            format!("platform:{}:account", platform.as_str()),
+            info.account,
+            true,
+            None::<&str>,
+        )?);
+
+        for (idx, line) in info.quota_lines.iter().enumerate() {
+            items.push(MenuItem::with_id(
+                app,
+                format!("platform:{}:quota:{}", platform.as_str(), idx),
+                line,
+                true,
+                None::<&str>,
+            )?);
+        }
     }
 
     let refs: Vec<&dyn IsMenuItem<R>> = items
@@ -776,6 +807,7 @@ fn get_account_display_info(platform: PlatformId, lang: &str) -> AccountDisplayI
     match platform {
         PlatformId::Antigravity => build_antigravity_display_info(lang),
         PlatformId::Codex => build_codex_display_info(lang),
+        PlatformId::Claude => build_claude_display_info(lang, true),
         PlatformId::Zed => build_zed_display_info(lang),
         PlatformId::GitHubCopilot => build_github_copilot_display_info(lang),
         PlatformId::Windsurf => build_windsurf_display_info(lang),
@@ -792,7 +824,20 @@ fn get_account_display_info(platform: PlatformId, lang: &str) -> AccountDisplayI
 
 #[cfg(not(target_os = "macos"))]
 fn build_antigravity_display_info(lang: &str) -> AccountDisplayInfo {
-    match crate::modules::account::get_current_account() {
+    if !is_antigravity_series_runtime_ready() {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    }
+
+    match crate::modules::platform_adapter::call_antigravity_series_with_timeout::<
+        Option<crate::models::Account>,
+    >(
+        "accounts.current",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    ) {
         Ok(Some(account)) => {
             let quota_lines = if let Some(quota) = &account.quota {
                 let grouped_lines = build_antigravity_group_quota_lines(lang, &quota.models);
@@ -961,7 +1006,20 @@ fn format_codex_window_label(window_minutes: Option<i64>, fallback: &str) -> Str
 
 #[cfg(not(target_os = "macos"))]
 fn build_codex_display_info(lang: &str) -> AccountDisplayInfo {
-    if let Some(account) = crate::modules::codex_account::get_current_account() {
+    if !crate::modules::platform_package::is_platform_package_runtime_ready("codex") {
+        return AccountDisplayInfo {
+            account: get_text("not_logged_in", lang),
+            quota_lines: Vec::new(),
+        };
+    }
+
+    if let Ok(Some(account)) = crate::modules::platform_adapter::call_codex_with_timeout::<
+        Option<crate::models::codex::CodexAccount>,
+    >(
+        "accounts.current",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    ) {
         let mut quota_lines = if let Some(quota) = &account.quota {
             let has_presence =
                 quota.hourly_window_present.is_some() || quota.weekly_window_present.is_some();
@@ -1016,9 +1074,141 @@ fn build_codex_display_info(lang: &str) -> AccountDisplayInfo {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn is_claude_desktop_account(account: &crate::models::claude::ClaudeAccount) -> bool {
+    matches!(
+        account.auth_mode,
+        crate::models::claude::ClaudeAuthMode::DesktopOAuth
+            | crate::models::claude::ClaudeAuthMode::DesktopGateway
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCurrentAccounts {
+    desktop_account_id: Option<String>,
+    code_account_id: Option<String>,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_claude_display_info(lang: &str, desktop: bool) -> AccountDisplayInfo {
+    if !crate::modules::platform_package::is_platform_package_installed("claude_manager") {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    }
+
+    let accounts = crate::modules::platform_adapter::call_claude_manager_with_timeout::<
+        Vec<crate::models::claude::ClaudeAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|account| is_claude_desktop_account(account) == desktop)
+    .collect::<Vec<_>>();
+    let current = crate::modules::platform_adapter::call_claude_manager_with_timeout::<
+        ClaudeCurrentAccounts,
+    >(
+        "accounts.current",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_default();
+    let current_id = if desktop {
+        current.desktop_account_id
+    } else {
+        current.code_account_id
+    };
+    let Some(account) = current_id
+        .as_deref()
+        .and_then(|id| accounts.iter().find(|account| account.id == id).cloned())
+        .or_else(|| {
+            accounts
+                .iter()
+                .max_by_key(|account| account.last_used)
+                .cloned()
+        })
+    else {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    };
+
+    let mut quota_lines = Vec::new();
+    if let Some(plan) = first_non_empty(&[
+        account.plan_type.as_deref(),
+        account.organization_name.as_deref(),
+    ]) {
+        quota_lines.push(format!("{}: {}", get_text("plan", lang), plan));
+    }
+
+    if let Some(quota) = &account.quota {
+        quota_lines.push(format_quota_line(
+            lang,
+            &get_text("claude_current_session", lang),
+            &format_percent_text(quota.five_hour_percentage),
+            Some(&format_reset_time_from_ts(lang, quota.five_hour_reset_time)),
+        ));
+        quota_lines.push(format_quota_line(
+            lang,
+            &get_text("claude_current_week_all_models", lang),
+            &format_percent_text(quota.seven_day_percentage),
+            Some(&format_reset_time_from_ts(lang, quota.seven_day_reset_time)),
+        ));
+    } else if let Some(error) = &account.quota_error {
+        quota_lines.push(error.message.clone());
+    }
+
+    if quota_lines.is_empty() {
+        quota_lines.push(get_text("loading", lang));
+    }
+
+    AccountDisplayInfo {
+        account: format!("📧 {}", account.email),
+        quota_lines,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn build_github_copilot_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::github_copilot_account::list_accounts();
-    let Some(account) = resolve_github_copilot_current_account(&accounts) else {
+    if !crate::modules::platform_package::is_platform_package_installed("github-copilot") {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    }
+
+    let accounts = crate::modules::platform_adapter::call_github_copilot_with_timeout::<
+        Vec<crate::models::github_copilot::GitHubCopilotAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .unwrap_or_default();
+    let current_id =
+        crate::modules::platform_adapter::call_github_copilot_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
+    let Some(account) = current_id
+        .as_deref()
+        .and_then(|id| accounts.iter().find(|account| account.id == id).cloned())
+        .or_else(|| {
+            accounts
+                .iter()
+                .max_by_key(|account| account.last_used)
+                .cloned()
+        })
+    else {
         return AccountDisplayInfo {
             account: format!("📧 {}", get_text("not_logged_in", lang)),
             quota_lines: vec!["—".to_string()],
@@ -1070,8 +1260,49 @@ struct WindsurfCreditsSummary {
 
 #[cfg(not(target_os = "macos"))]
 fn build_windsurf_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::windsurf_account::list_accounts();
-    let Some(account) = resolve_windsurf_current_account(&accounts) else {
+    if !crate::modules::platform_package::is_platform_package_installed("windsurf") {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    };
+    let accounts = match crate::modules::platform_adapter::call_windsurf_with_timeout::<
+        Vec<crate::models::windsurf::WindsurfAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    ) {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            logger::log_warn(&format!(
+                "[Tray][Windsurf] 读取账号列表失败，跳过托盘显示: {}",
+                error
+            ));
+            return AccountDisplayInfo {
+                account: format!("📧 {}", get_text("not_logged_in", lang)),
+                quota_lines: vec!["—".to_string()],
+            };
+        }
+    };
+    let current_id =
+        crate::modules::platform_adapter::call_windsurf_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
+    let Some(account) = current_id
+        .as_deref()
+        .and_then(|id| accounts.iter().find(|account| account.id == id).cloned())
+        .or_else(|| {
+            accounts
+                .iter()
+                .max_by_key(|account| account.last_used)
+                .cloned()
+        })
+    else {
         return AccountDisplayInfo {
             account: format!("📧 {}", get_text("not_logged_in", lang)),
             quota_lines: vec!["—".to_string()],
@@ -1098,7 +1329,21 @@ fn build_windsurf_display_info(lang: &str) -> AccountDisplayInfo {
 
 #[cfg(not(target_os = "macos"))]
 fn build_kiro_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::kiro_account::list_accounts();
+    let accounts = match crate::modules::platform_adapter::call_kiro_with_timeout::<
+        Vec<crate::models::kiro::KiroAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    ) {
+        Ok(accounts) => accounts,
+        Err(_) => {
+            return AccountDisplayInfo {
+                account: format!("📧 {}", get_text("not_logged_in", lang)),
+                quota_lines: vec!["—".to_string()],
+            };
+        }
+    };
     let Some(account) = resolve_kiro_current_account(&accounts) else {
         return AccountDisplayInfo {
             account: format!("📧 {}", get_text("not_logged_in", lang)),
@@ -1150,7 +1395,27 @@ fn build_kiro_display_info(lang: &str) -> AccountDisplayInfo {
 
 #[cfg(not(target_os = "macos"))]
 fn build_cursor_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::cursor_account::list_accounts();
+    if !crate::modules::platform_package::is_platform_package_installed("cursor") {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    }
+    let accounts: Vec<crate::models::cursor::CursorAccount> =
+        match crate::modules::platform_adapter::call_cursor_with_timeout(
+            "accounts.list",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        ) {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                crate::modules::logger::log_warn(&format!(
+                    "[Tray][Cursor] 读取账号列表失败: {}",
+                    error
+                ));
+                Vec::new()
+            }
+        };
     let Some(account) = resolve_cursor_current_account(&accounts) else {
         return AccountDisplayInfo {
             account: format!("📧 {}", get_text("not_logged_in", lang)),
@@ -1240,28 +1505,33 @@ fn collect_gemini_bucket_remaining(
     let Some(raw) = account.gemini_usage_raw.as_ref() else {
         return Vec::new();
     };
-    let Some(buckets) = raw.get("buckets").and_then(|item| item.as_array()) else {
+    let Some(groups) = raw.get("groups").and_then(|item| item.as_array()) else {
         return Vec::new();
     };
 
     let mut values = Vec::new();
-    for bucket in buckets {
-        let model_id = bucket
-            .get("modelId")
-            .and_then(|item| item.as_str())
-            .map(|item| item.trim())
-            .filter(|item| !item.is_empty())
-            .map(|item| item.to_string());
-        let remaining = parse_gemini_remaining_percent(bucket.get("remainingFraction"));
-        let reset_at = bucket.get("resetTime").and_then(parse_timestamp_like);
-        let (Some(model_id), Some(remaining)) = (model_id, remaining) else {
+    for group in groups {
+        let Some(buckets) = group.get("buckets").and_then(|item| item.as_array()) else {
             continue;
         };
-        values.push(GeminiBucketRemaining {
-            model_id,
-            remaining_percent: remaining,
-            reset_at,
-        });
+        for bucket in buckets {
+            let model_id = bucket
+                .get("bucketId")
+                .and_then(|item| item.as_str())
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_string());
+            let remaining = parse_gemini_remaining_percent(bucket.get("remainingFraction"));
+            let reset_at = bucket.get("resetTime").and_then(parse_timestamp_like);
+            let (Some(model_id), Some(remaining)) = (model_id, remaining) else {
+                continue;
+            };
+            values.push(GeminiBucketRemaining {
+                model_id,
+                remaining_percent: remaining,
+                reset_at,
+            });
+        }
     }
 
     values.sort_by(|a, b| a.model_id.cmp(&b.model_id));
@@ -1318,16 +1588,28 @@ fn normalize_gemini_plan_label(raw_plan: &str) -> &'static str {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn resolve_gemini_current_account(
-    accounts: &[crate::models::gemini::GeminiAccount],
-) -> Option<crate::models::gemini::GeminiAccount> {
-    crate::modules::gemini_account::resolve_current_account(accounts)
-}
-
-#[cfg(not(target_os = "macos"))]
 fn build_gemini_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::gemini_account::list_accounts();
-    let Some(account) = resolve_gemini_current_account(&accounts) else {
+    if !crate::modules::platform_package::is_platform_package_installed("gemini") {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    }
+    let accounts = crate::modules::platform_adapter::call_gemini::<
+        Vec<crate::models::gemini::GeminiAccount>,
+    >("accounts.list", serde_json::json!({}))
+    .unwrap_or_default();
+    let current_id = crate::modules::platform_adapter::call_gemini::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+    )
+    .ok()
+    .flatten();
+    let Some(account) = current_id
+        .as_deref()
+        .and_then(|id| accounts.iter().find(|account| account.id == id).cloned())
+        .or_else(|| accounts.first().cloned())
+    else {
         return AccountDisplayInfo {
             account: format!("📧 {}", get_text("not_logged_in", lang)),
             quota_lines: vec!["—".to_string()],
@@ -1342,13 +1624,18 @@ fn build_gemini_display_info(lang: &str) -> AccountDisplayInfo {
     }
 
     let buckets = collect_gemini_bucket_remaining(&account);
-    let pro_bucket =
-        pick_lowest_gemini_bucket(&buckets, |model_id| model_id.to_lowercase().contains("pro"));
-    let flash_bucket = pick_lowest_gemini_bucket(&buckets, |model_id| {
-        model_id.to_lowercase().contains("flash")
-    });
 
-    for (label, bucket) in [("Pro", pro_bucket), ("Flash", flash_bucket)] {
+    for (bucket_id, label_key, default_label) in [
+        ("gemini-5h", "gemini.quota.gemini5h", "Gemini 5h"),
+        (
+            "gemini-weekly",
+            "gemini.quota.geminiweekly",
+            "Gemini Weekly",
+        ),
+        ("3p-5h", "gemini.quota.3p5h", "Claude 5h"),
+        ("3p-weekly", "gemini.quota.3pweekly", "Claude Weekly"),
+    ] {
+        let bucket = buckets.iter().find(|b| b.model_id == bucket_id);
         let value_text = if let Some(item) = bucket {
             format!("{}% {}", item.remaining_percent, get_text("left", lang))
         } else {
@@ -1359,9 +1646,15 @@ fn build_gemini_display_info(lang: &str) -> AccountDisplayInfo {
         } else {
             get_text("reset_unknown", lang)
         };
+        let label = get_text(label_key, lang);
+        let label_ref = if label.is_empty() {
+            default_label
+        } else {
+            &label
+        };
         quota_lines.push(format_quota_line(
             lang,
-            label,
+            label_ref,
             &value_text,
             Some(&reset_text),
         ));
@@ -1383,26 +1676,94 @@ fn build_gemini_display_info(lang: &str) -> AccountDisplayInfo {
 
 #[cfg(not(target_os = "macos"))]
 fn build_codebuddy_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::codebuddy_account::list_accounts();
-    build_codebuddy_family_display_info(lang, resolve_codebuddy_current_account(&accounts))
+    let accounts = if crate::modules::platform_package::is_platform_package_installed("codebuddy") {
+        crate::modules::platform_adapter::call_codebuddy_with_timeout::<
+            Vec<crate::models::codebuddy::CodebuddyAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let account = crate::modules::platform_adapter::call_codebuddy_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| accounts.iter().find(|item| item.id == account_id).cloned());
+    build_codebuddy_family_display_info(lang, account)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn build_codebuddy_cn_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::codebuddy_cn_account::list_accounts();
-    build_codebuddy_family_display_info(lang, resolve_codebuddy_cn_current_account(&accounts))
+    let accounts =
+        if crate::modules::platform_package::is_platform_package_installed("codebuddy_cn") {
+            crate::modules::platform_adapter::call_codebuddy_cn_with_timeout::<
+                Vec<crate::models::codebuddy::CodebuddyAccount>,
+            >(
+                "accounts.list",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(20),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    let account =
+        crate::modules::platform_adapter::call_codebuddy_cn_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .ok()
+        .flatten()
+        .and_then(|account_id| accounts.iter().find(|item| item.id == account_id).cloned());
+    build_codebuddy_family_display_info(lang, account)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn build_workbuddy_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::workbuddy_account::list_accounts();
-    build_workbuddy_family_display_info(lang, resolve_workbuddy_current_account(&accounts))
+    if !crate::modules::platform_package::is_platform_package_runtime_ready("workbuddy") {
+        return build_workbuddy_family_display_info(lang, None);
+    }
+    let accounts = crate::modules::platform_adapter::call_workbuddy_with_timeout::<
+        Vec<crate::models::workbuddy::WorkbuddyAccount>,
+    >(
+        "accounts.list",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .unwrap_or_default();
+    let account = crate::modules::platform_adapter::call_workbuddy_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| accounts.iter().find(|item| item.id == account_id).cloned());
+    build_workbuddy_family_display_info(lang, account)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn build_zed_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::zed_account::list_accounts();
-    let current_id = crate::modules::zed_account::resolve_current_account_id();
+    let accounts =
+        crate::modules::platform_adapter::call_zed::<Vec<crate::models::zed::ZedAccount>>(
+            "accounts.list",
+            serde_json::json!({}),
+        )
+        .unwrap_or_default();
+    let current_id = crate::modules::platform_adapter::call_zed::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+    )
+    .ok()
+    .flatten();
     let account = current_id
         .as_deref()
         .and_then(|id| accounts.iter().find(|item| item.id == id))
@@ -1636,7 +1997,14 @@ fn strip_codebuddy_status_prefix(raw: &str) -> String {
 fn resolve_codebuddy_current_account(
     accounts: &[crate::models::codebuddy::CodebuddyAccount],
 ) -> Option<crate::models::codebuddy::CodebuddyAccount> {
-    crate::modules::codebuddy_account::resolve_current_account_id(accounts).and_then(|account_id| {
+    crate::modules::platform_adapter::call_codebuddy_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| {
         accounts
             .iter()
             .find(|account| account.id == account_id)
@@ -1648,21 +2016,33 @@ fn resolve_codebuddy_current_account(
 fn resolve_codebuddy_cn_current_account(
     accounts: &[crate::models::codebuddy::CodebuddyAccount],
 ) -> Option<crate::models::codebuddy::CodebuddyAccount> {
-    crate::modules::codebuddy_cn_account::resolve_current_account_id(accounts).and_then(
-        |account_id| {
-            accounts
-                .iter()
-                .find(|account| account.id == account_id)
-                .cloned()
-        },
+    crate::modules::platform_adapter::call_codebuddy_cn_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
     )
+    .ok()
+    .flatten()
+    .and_then(|account_id| {
+        accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
 fn resolve_workbuddy_current_account(
     accounts: &[crate::models::workbuddy::WorkbuddyAccount],
 ) -> Option<crate::models::workbuddy::WorkbuddyAccount> {
-    crate::modules::workbuddy_account::resolve_current_account_id(accounts).and_then(|account_id| {
+    crate::modules::platform_adapter::call_workbuddy_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| {
         accounts
             .iter()
             .find(|account| account.id == account_id)
@@ -1689,9 +2069,26 @@ fn json_as_f64(value: &serde_json::Value) -> Option<f64> {
 
 #[cfg(not(target_os = "macos"))]
 fn build_qoder_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::qoder_account::list_accounts();
-    let account = crate::modules::qoder_account::resolve_current_account_id(&accounts)
-        .and_then(|account_id| accounts.iter().find(|item| item.id == account_id).cloned());
+    let accounts = if crate::modules::platform_package::is_platform_package_installed("qoder") {
+        crate::modules::platform_adapter::call_qoder_with_timeout::<
+            Vec<crate::models::qoder::QoderAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let account = crate::modules::platform_adapter::call_qoder_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| accounts.iter().find(|item| item.id == account_id).cloned());
 
     let Some(account) = account else {
         return AccountDisplayInfo {
@@ -1961,8 +2358,37 @@ fn json_first_f64(values: &[Option<f64>]) -> Option<f64> {
 
 #[cfg(not(target_os = "macos"))]
 fn build_trae_display_info(lang: &str) -> AccountDisplayInfo {
-    let accounts = crate::modules::trae_account::list_accounts();
-    let Some(account) = resolve_trae_current_account(&accounts) else {
+    if !crate::modules::platform_package::is_platform_package_installed("trae") {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    }
+    let accounts: Vec<crate::models::trae::TraeAccount> =
+        match crate::modules::platform_adapter::call_trae_with_timeout(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        ) {
+            Ok(accounts) => accounts,
+            Err(err) => {
+                logger::log_warn(&format!(
+                    "[Tray][Trae] 读取账号列表失败，跳过托盘展示: {}",
+                    err
+                ));
+                return AccountDisplayInfo {
+                    account: format!("📧 {}", get_text("not_logged_in", lang)),
+                    quota_lines: vec!["—".to_string()],
+                };
+            }
+        };
+    let current_id: Option<String> = crate::modules::platform_adapter::call_trae_with_timeout(
+        "accounts.current",
+        serde_json::json!({}),
+        Duration::from_secs(20),
+    )
+    .unwrap_or(None);
+    let Some(account) = resolve_trae_current_account(&accounts, current_id.as_deref()) else {
         return AccountDisplayInfo {
             account: format!("📧 {}", get_text("not_logged_in", lang)),
             quota_lines: vec!["—".to_string()],
@@ -2403,31 +2829,23 @@ fn read_cursor_tray_usage(account: &crate::models::cursor::CursorAccount) -> Cur
 fn resolve_github_copilot_current_account(
     accounts: &[crate::models::github_copilot::GitHubCopilotAccount],
 ) -> Option<crate::models::github_copilot::GitHubCopilotAccount> {
-    if let Ok(settings) = crate::modules::github_copilot_instance::load_default_settings() {
-        if let Some(bind_id) = settings.bind_account_id {
-            let bind_id = bind_id.trim();
-            if !bind_id.is_empty() {
-                if let Some(account) = accounts.iter().find(|account| account.id == bind_id) {
-                    return Some(account.clone());
-                }
-            }
-        }
-    }
-
-    accounts
-        .iter()
-        .max_by_key(|account| account.last_used)
-        .cloned()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn resolve_windsurf_current_account(
-    accounts: &[crate::models::windsurf::WindsurfAccount],
-) -> Option<crate::models::windsurf::WindsurfAccount> {
-    crate::modules::windsurf_account::resolve_current_account_id(accounts).and_then(|account_id| {
+    crate::modules::platform_adapter::call_github_copilot_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| {
         accounts
             .iter()
             .find(|account| account.id == account_id)
+            .cloned()
+    })
+    .or_else(|| {
+        accounts
+            .iter()
+            .max_by_key(|account| account.last_used)
             .cloned()
     })
 }
@@ -2436,7 +2854,14 @@ fn resolve_windsurf_current_account(
 fn resolve_kiro_current_account(
     accounts: &[crate::models::kiro::KiroAccount],
 ) -> Option<crate::models::kiro::KiroAccount> {
-    crate::modules::kiro_account::resolve_current_account_id(accounts).and_then(|account_id| {
+    crate::modules::platform_adapter::call_kiro_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| {
         accounts
             .iter()
             .find(|account| account.id == account_id)
@@ -2448,7 +2873,14 @@ fn resolve_kiro_current_account(
 fn resolve_cursor_current_account(
     accounts: &[crate::models::cursor::CursorAccount],
 ) -> Option<crate::models::cursor::CursorAccount> {
-    crate::modules::cursor_account::resolve_current_account_id(accounts).and_then(|account_id| {
+    crate::modules::platform_adapter::call_cursor_with_timeout::<Option<String>>(
+        "accounts.current",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(20),
+    )
+    .ok()
+    .flatten()
+    .and_then(|account_id| {
         accounts
             .iter()
             .find(|account| account.id == account_id)
@@ -2459,8 +2891,9 @@ fn resolve_cursor_current_account(
 #[cfg(not(target_os = "macos"))]
 fn resolve_trae_current_account(
     accounts: &[crate::models::trae::TraeAccount],
+    current_id: Option<&str>,
 ) -> Option<crate::models::trae::TraeAccount> {
-    crate::modules::trae_account::resolve_current_account_id(accounts).and_then(|account_id| {
+    current_id.and_then(|account_id| {
         accounts
             .iter()
             .find(|account| account.id == account_id)
@@ -2764,16 +3197,35 @@ fn get_quota_snapshot<'a>(
     key: &str,
 ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
     let snapshots = quota_snapshots.and_then(|value| value.as_object())?;
-    let primary = snapshots.get(key).and_then(|snapshot| snapshot.as_object());
-    if primary.is_some() {
-        return primary;
-    }
-    if key == "premium_interactions" {
+    if matches!(key, "premium_models" | "premium_interactions") {
         return snapshots
             .get("premium_models")
+            .or_else(|| snapshots.get("premium_interactions"))
             .and_then(|snapshot| snapshot.as_object());
     }
-    None
+    snapshots.get(key).and_then(|snapshot| snapshot.as_object())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snapshot_without_displayable_quota(
+    snapshot: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    let Some(data) = snapshot else {
+        return false;
+    };
+    if data.get("unlimited").and_then(|value| value.as_bool()) == Some(true) {
+        return false;
+    }
+
+    let entitlement = data.get("entitlement").and_then(parse_json_number);
+    if entitlement.map(|value| value < 0.0).unwrap_or(false) {
+        return false;
+    }
+    if let Some(value) = entitlement {
+        return value <= 0.0;
+    }
+
+    data.get("has_quota").and_then(|value| value.as_bool()) == Some(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2790,6 +3242,10 @@ fn entitlement_from_snapshot(
 fn remaining_from_snapshot(
     snapshot: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<f64> {
+    if snapshot_without_displayable_quota(snapshot) {
+        return None;
+    }
+
     if let Some(remaining) = snapshot
         .and_then(|data| data.get("remaining"))
         .and_then(parse_json_number)
@@ -2836,6 +3292,9 @@ fn used_percent_from_snapshot(
         == Some(true)
     {
         return Some(0);
+    }
+    if snapshot_without_displayable_quota(snapshot) {
+        return None;
     }
 
     let entitlement = snapshot
@@ -3530,6 +3989,8 @@ fn get_text(key: &str, lang: &str) -> String {
         ("left", "zh-cn") => "剩余".to_string(),
         ("usage_status", "zh-cn") => "用量状态".to_string(),
         ("plan", "zh-cn") => "订阅".to_string(),
+        ("claude_current_session", "zh-cn") => "Current session".to_string(),
+        ("claude_current_week_all_models", "zh-cn") => "Current week (all models)".to_string(),
         ("token_spend", "zh-cn") => "Token 消耗".to_string(),
         ("edit_predictions", "zh-cn") => "编辑预测".to_string(),
         ("overdue_field", "zh-cn") => "是否欠费".to_string(),
@@ -3564,6 +4025,8 @@ fn get_text(key: &str, lang: &str) -> String {
         ("left", "zh-tw") => "剩餘".to_string(),
         ("usage_status", "zh-tw") => "用量狀態".to_string(),
         ("plan", "zh-tw") => "訂閱".to_string(),
+        ("claude_current_session", "zh-tw") => "目前工作階段".to_string(),
+        ("claude_current_week_all_models", "zh-tw") => "本週（所有模型）".to_string(),
         ("token_spend", "zh-tw") => "Token 消耗".to_string(),
         ("edit_predictions", "zh-tw") => "編輯預測".to_string(),
         ("overdue_field", "zh-tw") => "是否欠費".to_string(),
@@ -3598,6 +4061,8 @@ fn get_text(key: &str, lang: &str) -> String {
         ("left", "en") => "left".to_string(),
         ("usage_status", "en") => "Usage Status".to_string(),
         ("plan", "en") => "Plan".to_string(),
+        ("claude_current_session", "en") => "Current session".to_string(),
+        ("claude_current_week_all_models", "en") => "Current week (all models)".to_string(),
         ("token_spend", "en") => "Token Spend".to_string(),
         ("edit_predictions", "en") => "Edit Predictions".to_string(),
         ("overdue_field", "en") => "Overdue".to_string(),
@@ -3632,6 +4097,8 @@ fn get_text(key: &str, lang: &str) -> String {
         ("left", "ja") => "残り".to_string(),
         ("usage_status", "ja") => "利用状況".to_string(),
         ("plan", "ja") => "プラン".to_string(),
+        ("claude_current_session", "ja") => "現在のセッション".to_string(),
+        ("claude_current_week_all_models", "ja") => "今週（全モデル）".to_string(),
         ("token_spend", "ja") => "Token Spend".to_string(),
         ("edit_predictions", "ja") => "Edit Predictions".to_string(),
         ("overdue_field", "ja") => "延滞有無".to_string(),
@@ -3668,6 +4135,8 @@ fn get_text(key: &str, lang: &str) -> String {
         ("left", "ru") => "осталось".to_string(),
         ("usage_status", "ru") => "Статус использования".to_string(),
         ("plan", "ru") => "План".to_string(),
+        ("claude_current_session", "ru") => "Текущая сессия".to_string(),
+        ("claude_current_week_all_models", "ru") => "Текущая неделя (все модели)".to_string(),
         ("token_spend", "ru") => "Token Spend".to_string(),
         ("edit_predictions", "ru") => "Edit Predictions".to_string(),
         ("overdue_field", "ru") => "Есть задолженность".to_string(),
@@ -3702,6 +4171,8 @@ fn get_text(key: &str, lang: &str) -> String {
         ("left", _) => "left".to_string(),
         ("usage_status", _) => "Usage Status".to_string(),
         ("plan", _) => "Plan".to_string(),
+        ("claude_current_session", _) => "Current session".to_string(),
+        ("claude_current_week_all_models", _) => "Current week (all models)".to_string(),
         ("token_spend", _) => "Token Spend".to_string(),
         ("edit_predictions", _) => "Edit Predictions".to_string(),
         ("overdue_field", _) => "Overdue".to_string(),

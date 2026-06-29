@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, type MutableRefObject } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAccountStore } from '../stores/useAccountStore';
 import { useCodexAccountStore } from '../stores/useCodexAccountStore';
+import { useClaudeAccountStore } from '../stores/useClaudeAccountStore';
 import { useGitHubCopilotAccountStore } from '../stores/useGitHubCopilotAccountStore';
 import { useWindsurfAccountStore } from '../stores/useWindsurfAccountStore';
 import { useKiroAccountStore } from '../stores/useKiroAccountStore';
@@ -13,8 +14,21 @@ import { useWorkbuddyAccountStore } from '../stores/useWorkbuddyAccountStore';
 import { useQoderAccountStore } from '../stores/useQoderAccountStore';
 import { useTraeAccountStore } from '../stores/useTraeAccountStore';
 import { useZedAccountStore } from '../stores/useZedAccountStore';
+import { usePlatformPackageStore } from '../stores/usePlatformPackageStore';
+import { getGitHubCopilotAccountDisplayEmail } from '../types/githubCopilot';
+import { getWindsurfAccountDisplayEmail } from '../types/windsurf';
+import { getKiroAccountDisplayEmail } from '../types/kiro';
+import { getCursorAccountDisplayEmail } from '../types/cursor';
+import { getGeminiAccountDisplayEmail } from '../types/gemini';
+import { getClaudeAccountDisplayEmail } from '../types/claude';
+import { getCodebuddyAccountDisplayEmail } from '../types/codebuddy';
+import { getWorkbuddyAccountDisplayEmail } from '../types/workbuddy';
+import { getQoderAccountDisplayEmail } from '../types/qoder';
+import { getTraeAccountDisplayEmail } from '../types/trae';
+import { getZedAccountDisplayEmail } from '../types/zed';
 import {
   loadCurrentAccountRefreshMinutesMap,
+  getAccountRefreshMinutes,
   type CurrentAccountRefreshPlatform,
 } from '../utils/currentAccountRefresh';
 import {
@@ -22,12 +36,16 @@ import {
   type AutoRefreshSchedulerHandle,
   type AutoRefreshSchedulerTask,
 } from '../utils/autoRefreshScheduler';
+import { getAntigravityRuntimeTarget } from '../utils/antigravityRuntimeTarget';
 
 interface GeneralConfig {
   language: string;
   theme: string;
   auto_refresh_minutes: number;
   codex_auto_refresh_minutes: number;
+  claude_auto_refresh_minutes: number;
+  codex_sync_wsl: boolean;
+  codex_wsl_config_dir: string;
   ghcp_auto_refresh_minutes: number;
   windsurf_auto_refresh_minutes: number;
   kiro_auto_refresh_minutes: number;
@@ -101,6 +119,75 @@ function buildEnabledPlatformsSummary(
   return parts.join(', ');
 }
 
+function resolveCurrentMinutes(
+  platform: CurrentAccountRefreshPlatform,
+  email: string | null,
+  defaultMap: Record<CurrentAccountRefreshPlatform, number>,
+): number {
+  return email
+    ? getAccountRefreshMinutes(platform, email, defaultMap[platform])
+    : defaultMap[platform];
+}
+
+function getCurrentAccountEmails(): Record<CurrentAccountRefreshPlatform, string | null> {
+  const getProviderEmail = <T extends { id: string; email?: string | null }>(
+    store: { getState: () => { currentAccountId: string | null; accounts: T[] } },
+    getDisplayEmail: (account: T) => string,
+  ): string | null => {
+    const state = store.getState();
+    const account = state.accounts.find((a) => a.id === state.currentAccountId);
+    if (!account) return null;
+    return account.email ?? getDisplayEmail(account);
+  };
+
+  return {
+    antigravity: canOpenAntigravityRuntimeTarget()
+      ? useAccountStore.getState().currentAccount?.email ?? null
+      : null,
+    codex: usePlatformPackageStore.getState().canOpenPlatform('codex')
+      ? useCodexAccountStore.getState().currentAccount?.email ?? null
+      : null,
+    claude: usePlatformPackageStore.getState().canOpenPlatform('claude_manager')
+      ? getProviderEmail(useClaudeAccountStore, getClaudeAccountDisplayEmail)
+      : null,
+    ghcp: getProviderEmail(useGitHubCopilotAccountStore, getGitHubCopilotAccountDisplayEmail),
+    windsurf: usePlatformPackageStore.getState().canOpenPlatform('windsurf')
+      ? getProviderEmail(useWindsurfAccountStore, getWindsurfAccountDisplayEmail)
+      : null,
+    kiro: getProviderEmail(useKiroAccountStore, getKiroAccountDisplayEmail),
+    cursor: usePlatformPackageStore.getState().canOpenPlatform('cursor')
+      ? getProviderEmail(useCursorAccountStore, getCursorAccountDisplayEmail)
+      : null,
+    gemini: usePlatformPackageStore.getState().canOpenPlatform('gemini')
+      ? getProviderEmail(useGeminiAccountStore, getGeminiAccountDisplayEmail)
+      : null,
+    codebuddy: usePlatformPackageStore.getState().canOpenPlatform('codebuddy')
+      ? getProviderEmail(useCodebuddyAccountStore, getCodebuddyAccountDisplayEmail)
+      : null,
+    codebuddy_cn: usePlatformPackageStore.getState().canOpenPlatform('codebuddy_cn')
+      ? getProviderEmail(useCodebuddyCnAccountStore, getCodebuddyAccountDisplayEmail)
+      : null,
+    workbuddy: usePlatformPackageStore.getState().canOpenPlatform('workbuddy')
+      ? getProviderEmail(useWorkbuddyAccountStore, getWorkbuddyAccountDisplayEmail)
+      : null,
+    qoder: usePlatformPackageStore.getState().canOpenPlatform('qoder')
+      ? getProviderEmail(useQoderAccountStore, getQoderAccountDisplayEmail)
+      : null,
+    trae: usePlatformPackageStore.getState().canOpenPlatform('trae')
+      ? getProviderEmail(useTraeAccountStore, getTraeAccountDisplayEmail)
+      : null,
+    zed: getProviderEmail(useZedAccountStore, getZedAccountDisplayEmail),
+  };
+}
+
+function canOpenAntigravityRuntimeTarget(): boolean {
+  const target = getAntigravityRuntimeTarget();
+  const platformPackages = usePlatformPackageStore.getState();
+  return platformPackages.canOpenPlatform(target)
+    || platformPackages.canOpenPlatform('antigravity')
+    || platformPackages.canOpenPlatform('antigravity_ide');
+}
+
 export function useAutoRefresh() {
   const refreshAllQuotas = useAccountStore((state) => state.refreshAllQuotas);
   const fetchAccounts = useAccountStore((state) => state.fetchAccounts);
@@ -109,6 +196,9 @@ export function useAutoRefresh() {
   const refreshAllCodexQuotas = useCodexAccountStore((state) => state.refreshAllQuotas);
   const fetchCodexAccounts = useCodexAccountStore((state) => state.fetchAccounts);
   const fetchCurrentCodexAccount = useCodexAccountStore((state) => state.fetchCurrentAccount);
+  const refreshAllClaudeQuotas = useClaudeAccountStore((state) => state.refreshAllTokens);
+  const fetchCurrentClaudeAccountId = useClaudeAccountStore((state) => state.fetchCurrentAccountId);
+  const refreshClaudeQuota = useClaudeAccountStore((state) => state.refreshToken);
   const refreshAllGhcpTokens = useGitHubCopilotAccountStore((state) => state.refreshAllTokens);
   const fetchCurrentGhcpAccountId = useGitHubCopilotAccountStore((state) => state.fetchCurrentAccountId);
   const refreshGhcpToken = useGitHubCopilotAccountStore((state) => state.refreshToken);
@@ -143,10 +233,12 @@ export function useAutoRefresh() {
   const fetchCurrentZedAccountId = useZedAccountStore((state) => state.fetchCurrentAccountId);
   const refreshZedToken = useZedAccountStore((state) => state.refreshToken);
 
-  const agRefreshingRef = useRef(false);
-  const agCurrentRefreshingRef = useRef(false);
+  const antigravityRefreshingRef = useRef(false);
+  const antigravityCurrentRefreshingRef = useRef(false);
   const codexRefreshingRef = useRef(false);
   const codexCurrentRefreshingRef = useRef(false);
+  const claudeRefreshingRef = useRef(false);
+  const claudeCurrentRefreshingRef = useRef(false);
   const ghcpRefreshingRef = useRef(false);
   const ghcpCurrentRefreshingRef = useRef(false);
   const windsurfRefreshingRef = useRef(false);
@@ -270,6 +362,7 @@ export function useAutoRefresh() {
                     theme: config.theme,
                     autoRefreshMinutes: 2,
                     codexAutoRefreshMinutes: config.codex_auto_refresh_minutes,
+                    claudeAutoRefreshMinutes: config.claude_auto_refresh_minutes,
                     ghcpAutoRefreshMinutes: config.ghcp_auto_refresh_minutes,
                     windsurfAutoRefreshMinutes: config.windsurf_auto_refresh_minutes,
                     kiroAutoRefreshMinutes: config.kiro_auto_refresh_minutes,
@@ -322,6 +415,7 @@ export function useAutoRefresh() {
           stopScheduler();
 
           const currentRefreshMinutesMap = loadCurrentAccountRefreshMinutesMap();
+          const currentAccountEmails = getCurrentAccountEmails();
           const runProviderCurrentRefresh = async (
             fetchCurrentProviderAccountId: () => Promise<string | null>,
             refreshProviderToken: (accountId: string) => Promise<void>,
@@ -332,15 +426,19 @@ export function useAutoRefresh() {
             }
             await refreshProviderToken(accountId);
           };
+          const optionalDescriptor = (
+            enabled: boolean,
+            descriptor: PlatformRefreshDescriptor,
+          ): PlatformRefreshDescriptor[] => (enabled ? [descriptor] : []);
 
           const descriptors: PlatformRefreshDescriptor[] = [
-            {
+            ...optionalDescriptor(canOpenAntigravityRuntimeTarget(), {
               key: 'antigravity',
               label: 'Antigravity IDE',
               intervalMinutes: config.auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.antigravity,
-              fullRefreshingRef: agRefreshingRef,
-              currentRefreshingRef: agCurrentRefreshingRef,
+              currentMinutes: resolveCurrentMinutes('antigravity', currentAccountEmails.antigravity, currentRefreshMinutesMap),
+              fullRefreshingRef: antigravityRefreshingRef,
+              currentRefreshingRef: antigravityCurrentRefreshingRef,
               runFullRefresh: async () => {
                 await refreshAllQuotas();
               },
@@ -355,12 +453,12 @@ export function useAutoRefresh() {
                 await fetchAccounts();
                 await fetchCurrentAccount();
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('codex'), {
               key: 'codex',
               label: 'Codex',
               intervalMinutes: config.codex_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.codex,
+              currentMinutes: resolveCurrentMinutes('codex', currentAccountEmails.codex, currentRefreshMinutesMap),
               fullRefreshingRef: codexRefreshingRef,
               currentRefreshingRef: codexCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -377,12 +475,26 @@ export function useAutoRefresh() {
                 await fetchCodexAccounts();
                 await fetchCurrentCodexAccount();
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('claude_manager'), {
+              key: 'claude',
+              label: 'Claude',
+              intervalMinutes: config.claude_auto_refresh_minutes,
+              currentMinutes: resolveCurrentMinutes('claude', currentAccountEmails.claude, currentRefreshMinutesMap),
+              fullRefreshingRef: claudeRefreshingRef,
+              currentRefreshingRef: claudeCurrentRefreshingRef,
+              runFullRefresh: async () => {
+                await refreshAllClaudeQuotas();
+              },
+              runCurrentRefresh: async () => {
+                await runProviderCurrentRefresh(fetchCurrentClaudeAccountId, refreshClaudeQuota);
+              },
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('github-copilot'), {
               key: 'ghcp',
               label: 'GitHub Copilot',
               intervalMinutes: config.ghcp_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.ghcp,
+              currentMinutes: resolveCurrentMinutes('ghcp', currentAccountEmails.ghcp, currentRefreshMinutesMap),
               fullRefreshingRef: ghcpRefreshingRef,
               currentRefreshingRef: ghcpCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -391,12 +503,12 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentGhcpAccountId, refreshGhcpToken);
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('windsurf'), {
               key: 'windsurf',
               label: 'Windsurf',
               intervalMinutes: config.windsurf_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.windsurf,
+              currentMinutes: resolveCurrentMinutes('windsurf', currentAccountEmails.windsurf, currentRefreshMinutesMap),
               fullRefreshingRef: windsurfRefreshingRef,
               currentRefreshingRef: windsurfCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -408,12 +520,12 @@ export function useAutoRefresh() {
                   refreshWindsurfToken,
                 );
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('kiro'), {
               key: 'kiro',
               label: 'Kiro',
               intervalMinutes: config.kiro_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.kiro,
+              currentMinutes: resolveCurrentMinutes('kiro', currentAccountEmails.kiro, currentRefreshMinutesMap),
               fullRefreshingRef: kiroRefreshingRef,
               currentRefreshingRef: kiroCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -422,12 +534,12 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentKiroAccountId, refreshKiroToken);
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('cursor'), {
               key: 'cursor',
               label: 'Cursor',
               intervalMinutes: config.cursor_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.cursor,
+              currentMinutes: resolveCurrentMinutes('cursor', currentAccountEmails.cursor, currentRefreshMinutesMap),
               fullRefreshingRef: cursorRefreshingRef,
               currentRefreshingRef: cursorCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -436,12 +548,12 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentCursorAccountId, refreshCursorToken);
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('gemini'), {
               key: 'gemini',
               label: 'Gemini',
               intervalMinutes: config.gemini_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.gemini,
+              currentMinutes: resolveCurrentMinutes('gemini', currentAccountEmails.gemini, currentRefreshMinutesMap),
               fullRefreshingRef: geminiRefreshingRef,
               currentRefreshingRef: geminiCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -450,12 +562,12 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentGeminiAccountId, refreshGeminiToken);
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('codebuddy'), {
               key: 'codebuddy',
               label: 'CodeBuddy',
               intervalMinutes: config.codebuddy_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.codebuddy,
+              currentMinutes: resolveCurrentMinutes('codebuddy', currentAccountEmails.codebuddy, currentRefreshMinutesMap),
               fullRefreshingRef: codebuddyRefreshingRef,
               currentRefreshingRef: codebuddyCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -467,12 +579,12 @@ export function useAutoRefresh() {
                   refreshCodebuddyToken,
                 );
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('codebuddy_cn'), {
               key: 'codebuddy_cn',
               label: 'CodeBuddy CN',
               intervalMinutes: config.codebuddy_cn_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.codebuddy_cn,
+              currentMinutes: resolveCurrentMinutes('codebuddy_cn', currentAccountEmails.codebuddy_cn, currentRefreshMinutesMap),
               fullRefreshingRef: codebuddyCnRefreshingRef,
               currentRefreshingRef: codebuddyCnCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -484,12 +596,12 @@ export function useAutoRefresh() {
                   refreshCodebuddyCnToken,
                 );
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('workbuddy'), {
               key: 'workbuddy',
               label: 'WorkBuddy',
               intervalMinutes: config.workbuddy_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.workbuddy,
+              currentMinutes: resolveCurrentMinutes('workbuddy', currentAccountEmails.workbuddy, currentRefreshMinutesMap),
               fullRefreshingRef: workbuddyRefreshingRef,
               currentRefreshingRef: workbuddyCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -501,12 +613,12 @@ export function useAutoRefresh() {
                   refreshWorkbuddyToken,
                 );
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('qoder'), {
               key: 'qoder',
               label: 'Qoder',
               intervalMinutes: config.qoder_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.qoder,
+              currentMinutes: resolveCurrentMinutes('qoder', currentAccountEmails.qoder, currentRefreshMinutesMap),
               fullRefreshingRef: qoderRefreshingRef,
               currentRefreshingRef: qoderCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -515,12 +627,12 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentQoderAccountId, refreshQoderToken);
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('trae'), {
               key: 'trae',
               label: 'Trae',
               intervalMinutes: config.trae_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.trae,
+              currentMinutes: resolveCurrentMinutes('trae', currentAccountEmails.trae, currentRefreshMinutesMap),
               fullRefreshingRef: traeRefreshingRef,
               currentRefreshingRef: traeCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -529,12 +641,12 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentTraeAccountId, refreshTraeToken);
               },
-            },
-            {
+            }),
+            ...optionalDescriptor(usePlatformPackageStore.getState().canOpenPlatform('zed'), {
               key: 'zed',
               label: 'Zed',
               intervalMinutes: config.zed_auto_refresh_minutes,
-              currentMinutes: currentRefreshMinutesMap.zed,
+              currentMinutes: resolveCurrentMinutes('zed', currentAccountEmails.zed, currentRefreshMinutesMap),
               fullRefreshingRef: zedRefreshingRef,
               currentRefreshingRef: zedCurrentRefreshingRef,
               runFullRefresh: async () => {
@@ -543,7 +655,7 @@ export function useAutoRefresh() {
               runCurrentRefresh: async () => {
                 await runProviderCurrentRefresh(fetchCurrentZedAccountId, refreshZedToken);
               },
-            },
+            }),
           ];
 
           const tasks: AutoRefreshSchedulerTask[] = [];
@@ -566,7 +678,7 @@ export function useAutoRefresh() {
               console.log(`[AutoRefresh] ${descriptor.label} 已禁用`);
             }
 
-            if (descriptor.intervalMinutes > 0) {
+            if (descriptor.intervalMinutes > 0 && descriptor.currentMinutes > 0) {
               console.log(`[AutoRefresh] ${descriptor.label} 当前账号刷新: 每 ${descriptor.currentMinutes} 分钟`);
               tasks.push({
                 key: `current:${descriptor.key}`,
@@ -582,7 +694,7 @@ export function useAutoRefresh() {
                   ),
               });
             } else {
-              console.log(`[AutoRefresh] ${descriptor.label} 当前账号刷新已禁用（配额自动刷新未开启）`);
+              console.log(`[AutoRefresh] ${descriptor.label} 当前账号刷新已禁用${descriptor.currentMinutes === -1 ? '（账号级覆盖禁用）' : '（配额自动刷新未开启）'}`);
             }
           }
 
@@ -617,6 +729,7 @@ export function useAutoRefresh() {
     executeWithGuard,
     fetchCodexAccounts,
     fetchCurrentAccount,
+    fetchCurrentClaudeAccountId,
     fetchCurrentCodebuddyAccountId,
     fetchCurrentCodebuddyCnAccountId,
     fetchCurrentCodexAccount,
@@ -633,6 +746,7 @@ export function useAutoRefresh() {
     refreshAllCodebuddyCnTokens,
     refreshAllCodebuddyTokens,
     refreshAllCodexQuotas,
+    refreshAllClaudeQuotas,
     refreshAllCursorTokens,
     refreshAllGeminiTokens,
     refreshAllGhcpTokens,
@@ -645,6 +759,7 @@ export function useAutoRefresh() {
     refreshAllZedTokens,
     refreshCodebuddyCnToken,
     refreshCodebuddyToken,
+    refreshClaudeQuota,
     refreshCursorToken,
     refreshGeminiToken,
     refreshGhcpToken,
@@ -677,6 +792,7 @@ export function useAutoRefresh() {
     };
 
     window.addEventListener('config-updated', handleConfigUpdate);
+    window.addEventListener('agtools:platform-package-changed', handleConfigUpdate);
 
     return () => {
       destroyedRef.current = true;
@@ -686,6 +802,7 @@ export function useAutoRefresh() {
       }
       stopScheduler();
       window.removeEventListener('config-updated', handleConfigUpdate);
+      window.removeEventListener('agtools:platform-package-changed', handleConfigUpdate);
     };
   }, [setupAutoRefresh, stopScheduler]);
 }

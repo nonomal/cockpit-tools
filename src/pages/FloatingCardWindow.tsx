@@ -4,10 +4,11 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { LogicalSize } from '@tauri-apps/api/dpi';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
-import { TauriEvent, listen } from '@tauri-apps/api/event';
+import { TauriEvent, emit, listen } from '@tauri-apps/api/event';
 import { useTranslation } from 'react-i18next';
 import {
   buildAntigravityAccountPresentation,
+  buildClaudeAccountPresentation,
   buildCodebuddyAccountPresentation,
   buildCodexAccountPresentation,
   buildCursorAccountPresentation,
@@ -35,6 +36,7 @@ import {
   type FloatingCardInstanceContext,
 } from '../services/floatingCardService';
 import { useAccountStore } from '../stores/useAccountStore';
+import { useClaudeAccountStore } from '../stores/useClaudeAccountStore';
 import { useCodebuddyAccountStore } from '../stores/useCodebuddyAccountStore';
 import { useCodebuddyCnAccountStore } from '../stores/useCodebuddyCnAccountStore';
 import { useCodexAccountStore } from '../stores/useCodexAccountStore';
@@ -42,13 +44,17 @@ import { useCursorAccountStore } from '../stores/useCursorAccountStore';
 import { useGeminiAccountStore } from '../stores/useGeminiAccountStore';
 import { useGitHubCopilotAccountStore } from '../stores/useGitHubCopilotAccountStore';
 import { useKiroAccountStore } from '../stores/useKiroAccountStore';
+import { usePlatformPackageStore } from '../stores/usePlatformPackageStore';
 import { usePlatformLayoutStore } from '../stores/usePlatformLayoutStore';
+import { useRemoteConfigStore } from '../stores/useRemoteConfigStore';
 import { useQoderAccountStore } from '../stores/useQoderAccountStore';
 import { useTraeAccountStore } from '../stores/useTraeAccountStore';
 import { useWindsurfAccountStore } from '../stores/useWindsurfAccountStore';
 import { useWorkbuddyAccountStore } from '../stores/useWorkbuddyAccountStore';
 import { useZedAccountStore } from '../stores/useZedAccountStore';
 import { useCodebuddyCnInstanceStore } from '../stores/useCodebuddyCnInstanceStore';
+import { useAntigravityLegacyInstanceStore } from '../stores/useAntigravityLegacyInstanceStore';
+import { useClaudeInstanceStore } from '../stores/useClaudeInstanceStore';
 import { useCodebuddyInstanceStore } from '../stores/useCodebuddyInstanceStore';
 import { useCodexInstanceStore } from '../stores/useCodexInstanceStore';
 import { useCursorInstanceStore } from '../stores/useCursorInstanceStore';
@@ -65,9 +71,9 @@ import { ALL_PLATFORM_IDS, PLATFORM_PAGE_MAP, PlatformId } from '../types/platfo
 import type { InstanceProfile } from '../types/instance';
 import { isPrivacyModeEnabledByDefault, maskSensitiveValue } from '../utils/privacy';
 import { getPlatformLabel, renderPlatformIcon } from '../utils/platformMeta';
-import { getAntigravityRuntimeTarget } from '../utils/antigravityRuntimeTarget';
 import {
   getRecommendedAntigravityAccount,
+  getRecommendedClaudeAccount,
   getRecommendedCodebuddyAccount,
   getRecommendedCodebuddyCnAccount,
   getRecommendedCodexAccount,
@@ -111,6 +117,7 @@ type FloatingCardGeneralConfig = {
 type FloatingCardAccount =
   | ReturnType<typeof useAccountStore.getState>['accounts'][number]
   | ReturnType<typeof useCodexAccountStore.getState>['accounts'][number]
+  | ReturnType<typeof useClaudeAccountStore.getState>['accounts'][number]
   | ReturnType<typeof useGitHubCopilotAccountStore.getState>['accounts'][number]
   | ReturnType<typeof useWindsurfAccountStore.getState>['accounts'][number]
   | ReturnType<typeof useKiroAccountStore.getState>['accounts'][number]
@@ -158,10 +165,21 @@ function resolveAppliedTheme(theme: string): 'light' | 'dark' {
 function resolveInstanceStoreApi(platformId: PlatformId): FloatingCardInstanceStoreApi | null {
   switch (platformId) {
     case 'antigravity':
+      return usePlatformPackageStore.getState().canOpenPlatform('antigravity')
+        ? useAntigravityLegacyInstanceStore.getState()
+        : null;
     case 'antigravity_ide':
-      return useInstanceStore.getState();
+      return usePlatformPackageStore.getState().canOpenPlatform('antigravity_ide')
+        ? useInstanceStore.getState()
+        : null;
     case 'codex':
-      return useCodexInstanceStore.getState();
+      return usePlatformPackageStore.getState().canOpenPlatform('codex')
+        ? useCodexInstanceStore.getState()
+        : null;
+    case 'claude_manager':
+      return usePlatformPackageStore.getState().canOpenPlatform('claude_manager')
+        ? useClaudeInstanceStore.getState()
+        : null;
     case 'github-copilot':
       return useGitHubCopilotInstanceStore.getState();
     case 'windsurf':
@@ -199,8 +217,14 @@ export function FloatingCardWindow() {
     INSTANCE_FLOATING_CARD_WINDOW_LABEL_PREFIX,
   );
   const orderedPlatformIds = usePlatformLayoutStore((state) => state.orderedPlatformIds);
-  const { accounts: agAccounts, currentAccount: agCurrent } = useAccountStore();
+  const remoteHiddenPlatformIds = useRemoteConfigStore((state) => state.hiddenPlatformIds);
+  const fetchRemoteConfigState = useRemoteConfigStore((state) => state.fetchState);
+  const { accounts: agAccounts, currentAccountsByTarget: agCurrentAccountsByTarget } = useAccountStore();
   const { accounts: codexAccounts, currentAccount: codexCurrent } = useCodexAccountStore();
+  const {
+    accounts: claudeAccounts,
+    currentAccountId: claudeCurrentId,
+  } = useClaudeAccountStore();
   const {
     accounts: githubCopilotAccounts,
     currentAccountId: githubCopilotCurrentId,
@@ -233,6 +257,12 @@ export function FloatingCardWindow() {
     accounts: qoderAccounts,
     currentAccountId: qoderCurrentId,
   } = useQoderAccountStore();
+  const claudeRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('claude_manager'));
+  const codexRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('codex'));
+  const codebuddyRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('codebuddy'));
+  const codebuddyCnRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('codebuddy_cn'));
+  const qoderRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('qoder'));
+  const workbuddyRuntimeReady = usePlatformPackageStore((state) => state.canOpenPlatform('workbuddy'));
   const {
     accounts: traeAccounts,
     currentAccountId: traeCurrentId,
@@ -262,6 +292,10 @@ export function FloatingCardWindow() {
   const [refreshingAccountId, setRefreshingAccountId] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [platformLoading, setPlatformLoading] = useState(false);
+  const remoteHiddenPlatformSet = useMemo(
+    () => new Set(remoteHiddenPlatformIds),
+    [remoteHiddenPlatformIds],
+  );
 
   const platformOrder = useMemo(() => {
     const seen = new Set<PlatformId>();
@@ -269,18 +303,24 @@ export function FloatingCardWindow() {
 
     for (const platformId of orderedPlatformIds) {
       if (!ALL_PLATFORM_IDS.includes(platformId) || seen.has(platformId)) continue;
+      if (remoteHiddenPlatformSet.has(platformId)) continue;
       ordered.push(platformId);
       seen.add(platformId);
     }
 
     for (const platformId of ALL_PLATFORM_IDS) {
       if (seen.has(platformId)) continue;
+      if (remoteHiddenPlatformSet.has(platformId)) continue;
       ordered.push(platformId);
       seen.add(platformId);
     }
 
     return ordered;
-  }, [orderedPlatformIds]);
+  }, [orderedPlatformIds, remoteHiddenPlatformSet]);
+
+  useEffect(() => {
+    void fetchRemoteConfigState(false);
+  }, [fetchRemoteConfigState]);
 
   useEffect(() => {
     if (platformOrder.includes(selectedPlatform)) {
@@ -347,7 +387,7 @@ export function FloatingCardWindow() {
 
   const syncPrivacyMode = useCallback(() => {
     setPrivacyModeEnabled(isPrivacyModeEnabledByDefault());
-  }, []);
+  }, [qoderRuntimeReady]);
 
   const maskAccountText = useCallback(
     (value?: string | null) => maskSensitiveValue(value, privacyModeEnabled),
@@ -372,19 +412,28 @@ export function FloatingCardWindow() {
     setPlatformLoading(true);
     try {
       switch (platformId) {
-        case 'antigravity': {
+        case 'antigravity':
+        case 'antigravity_ide': {
           await Promise.allSettled([
             useAccountStore.getState().fetchAccounts(),
-            useAccountStore.getState().fetchCurrentAccount(),
+            useAccountStore.getState().fetchCurrentAccount(platformId),
           ]);
           const groups = await getDisplayGroups();
           setDisplayGroups(groups);
           break;
         }
         case 'codex':
+          if (!codexRuntimeReady) break;
           await Promise.allSettled([
             useCodexAccountStore.getState().fetchAccounts(),
             useCodexAccountStore.getState().fetchCurrentAccount(),
+          ]);
+          break;
+        case 'claude_manager':
+          if (!claudeRuntimeReady) break;
+          await Promise.allSettled([
+            useClaudeAccountStore.getState().fetchAccounts(),
+            useClaudeAccountStore.getState().fetchCurrentAccountId(),
           ]);
           break;
         case 'github-copilot':
@@ -403,18 +452,22 @@ export function FloatingCardWindow() {
           await useGeminiAccountStore.getState().fetchAccounts();
           break;
         case 'codebuddy':
+          if (!codebuddyRuntimeReady) break;
           await useCodebuddyAccountStore.getState().fetchAccounts();
           break;
         case 'codebuddy_cn':
+          if (!codebuddyCnRuntimeReady) break;
           await useCodebuddyCnAccountStore.getState().fetchAccounts();
           break;
         case 'qoder':
+          if (!qoderRuntimeReady) break;
           await useQoderAccountStore.getState().fetchAccounts();
           break;
         case 'trae':
           await useTraeAccountStore.getState().fetchAccounts();
           break;
         case 'workbuddy':
+          if (!workbuddyRuntimeReady) break;
           await useWorkbuddyAccountStore.getState().fetchAccounts();
           break;
         case 'zed':
@@ -424,7 +477,7 @@ export function FloatingCardWindow() {
     } finally {
       setPlatformLoading(false);
     }
-  }, []);
+  }, [claudeRuntimeReady, codebuddyCnRuntimeReady, codebuddyRuntimeReady, codexRuntimeReady, qoderRuntimeReady, workbuddyRuntimeReady]);
 
   useEffect(() => {
     void fetchPlatformData(selectedPlatform);
@@ -660,24 +713,36 @@ export function FloatingCardWindow() {
     [geminiAccounts, geminiCurrentId],
   );
   const codebuddyCurrent = useMemo(
-    () => resolveCurrentAccountById(codebuddyAccounts, codebuddyCurrentId),
-    [codebuddyAccounts, codebuddyCurrentId],
+    () => resolveCurrentAccountById(
+      codebuddyRuntimeReady ? codebuddyAccounts : [],
+      codebuddyRuntimeReady ? codebuddyCurrentId : null,
+    ),
+    [codebuddyAccounts, codebuddyCurrentId, codebuddyRuntimeReady],
   );
   const codebuddyCnCurrent = useMemo(
-    () => resolveCurrentAccountById(codebuddyCnAccounts, codebuddyCnCurrentId),
-    [codebuddyCnAccounts, codebuddyCnCurrentId],
+    () => resolveCurrentAccountById(
+      codebuddyCnRuntimeReady ? codebuddyCnAccounts : [],
+      codebuddyCnRuntimeReady ? codebuddyCnCurrentId : null,
+    ),
+    [codebuddyCnAccounts, codebuddyCnCurrentId, codebuddyCnRuntimeReady],
   );
   const qoderCurrent = useMemo(
-    () => resolveCurrentAccountById(qoderAccounts, qoderCurrentId),
-    [qoderAccounts, qoderCurrentId],
+    () => resolveCurrentAccountById(
+      qoderRuntimeReady ? qoderAccounts : [],
+      qoderRuntimeReady ? qoderCurrentId : null,
+    ),
+    [qoderAccounts, qoderCurrentId, qoderRuntimeReady],
   );
   const traeCurrent = useMemo(
     () => resolveCurrentAccountById(traeAccounts, traeCurrentId),
     [traeAccounts, traeCurrentId],
   );
   const workbuddyCurrent = useMemo(
-    () => resolveCurrentAccountById(workbuddyAccounts, workbuddyCurrentId),
-    [workbuddyAccounts, workbuddyCurrentId],
+    () => resolveCurrentAccountById(
+      workbuddyRuntimeReady ? workbuddyAccounts : [],
+      workbuddyRuntimeReady ? workbuddyCurrentId : null,
+    ),
+    [workbuddyAccounts, workbuddyCurrentId, workbuddyRuntimeReady],
   );
   const zedCurrent = useMemo(
     () => resolveCurrentAccountById(zedAccounts, zedCurrentId),
@@ -690,12 +755,20 @@ export function FloatingCardWindow() {
       case 'antigravity_ide':
         return {
           accounts: agAccounts,
-          actualCurrentAccount: agCurrent,
+          actualCurrentAccount: agCurrentAccountsByTarget[selectedPlatform] ?? null,
         };
       case 'codex':
         return {
-          accounts: codexAccounts,
-          actualCurrentAccount: codexCurrent,
+          accounts: codexRuntimeReady ? codexAccounts : [],
+          actualCurrentAccount: codexRuntimeReady ? codexCurrent : null,
+        };
+      case 'claude_manager':
+        return {
+          accounts: claudeRuntimeReady ? claudeAccounts : [],
+          actualCurrentAccount: resolveCurrentAccountById(
+            claudeRuntimeReady ? claudeAccounts : [],
+            claudeRuntimeReady ? claudeCurrentId : null,
+          ),
         };
       case 'github-copilot':
         return {
@@ -724,17 +797,17 @@ export function FloatingCardWindow() {
         };
       case 'codebuddy':
         return {
-          accounts: codebuddyAccounts,
+          accounts: codebuddyRuntimeReady ? codebuddyAccounts : [],
           actualCurrentAccount: codebuddyCurrent,
         };
       case 'codebuddy_cn':
         return {
-          accounts: codebuddyCnAccounts,
+          accounts: codebuddyCnRuntimeReady ? codebuddyCnAccounts : [],
           actualCurrentAccount: codebuddyCnCurrent,
         };
       case 'qoder':
         return {
-          accounts: qoderAccounts,
+          accounts: qoderRuntimeReady ? qoderAccounts : [],
           actualCurrentAccount: qoderCurrent,
         };
       case 'trae':
@@ -744,7 +817,7 @@ export function FloatingCardWindow() {
         };
       case 'workbuddy':
         return {
-          accounts: workbuddyAccounts,
+          accounts: workbuddyRuntimeReady ? workbuddyAccounts : [],
           actualCurrentAccount: workbuddyCurrent,
         };
       case 'zed':
@@ -755,13 +828,19 @@ export function FloatingCardWindow() {
     }
   }, [
     agAccounts,
-    agCurrent,
+    agCurrentAccountsByTarget,
+    claudeAccounts,
+    claudeCurrentId,
+    claudeRuntimeReady,
     codebuddyAccounts,
     codebuddyCnAccounts,
     codebuddyCnCurrent,
     codebuddyCurrent,
+    codebuddyCnRuntimeReady,
+    codebuddyRuntimeReady,
     codexAccounts,
     codexCurrent,
+    codexRuntimeReady,
     cursorAccounts,
     cursorCurrent,
     geminiAccounts,
@@ -772,6 +851,7 @@ export function FloatingCardWindow() {
     kiroCurrent,
     qoderAccounts,
     qoderCurrent,
+    qoderRuntimeReady,
     selectedPlatform,
     traeAccounts,
     traeCurrent,
@@ -779,6 +859,7 @@ export function FloatingCardWindow() {
     windsurfCurrent,
     workbuddyAccounts,
     workbuddyCurrent,
+    workbuddyRuntimeReady,
     zedAccounts,
     zedCurrent,
   ]);
@@ -797,9 +878,15 @@ export function FloatingCardWindow() {
     const effectiveCurrentId = currentAccount?.id;
     switch (selectedPlatform) {
       case 'antigravity':
+      case 'antigravity_ide':
         return getRecommendedAntigravityAccount(agAccounts, effectiveCurrentId);
       case 'codex':
-        return getRecommendedCodexAccount(codexAccounts, effectiveCurrentId);
+        return getRecommendedCodexAccount(codexRuntimeReady ? codexAccounts : [], effectiveCurrentId);
+      case 'claude_manager':
+        return getRecommendedClaudeAccount(
+          claudeRuntimeReady ? claudeAccounts : [],
+          effectiveCurrentId,
+        );
       case 'github-copilot':
         return getRecommendedGitHubCopilotAccount(githubCopilotAccounts, effectiveCurrentId);
       case 'windsurf':
@@ -811,33 +898,52 @@ export function FloatingCardWindow() {
       case 'gemini':
         return getRecommendedGeminiAccount(geminiAccounts, effectiveCurrentId);
       case 'codebuddy':
-        return getRecommendedCodebuddyAccount(codebuddyAccounts, effectiveCurrentId);
+        return getRecommendedCodebuddyAccount(
+          codebuddyRuntimeReady ? codebuddyAccounts : [],
+          effectiveCurrentId,
+        );
       case 'codebuddy_cn':
-        return getRecommendedCodebuddyCnAccount(codebuddyCnAccounts, effectiveCurrentId);
+        return getRecommendedCodebuddyCnAccount(
+          codebuddyCnRuntimeReady ? codebuddyCnAccounts : [],
+          effectiveCurrentId,
+        );
       case 'qoder':
-        return getRecommendedQoderAccount(qoderAccounts, effectiveCurrentId);
+        return getRecommendedQoderAccount(
+          qoderRuntimeReady ? qoderAccounts : [],
+          effectiveCurrentId,
+        );
       case 'trae':
         return getRecommendedTraeAccount(traeAccounts, effectiveCurrentId);
       case 'workbuddy':
-        return getRecommendedWorkbuddyAccount(workbuddyAccounts, effectiveCurrentId);
+        return getRecommendedWorkbuddyAccount(
+          workbuddyRuntimeReady ? workbuddyAccounts : [],
+          effectiveCurrentId,
+        );
       case 'zed':
         return getRecommendedZedAccount(zedAccounts, effectiveCurrentId);
     }
   }, [
     agAccounts,
+    claudeAccounts,
+    claudeRuntimeReady,
     codebuddyAccounts,
     codebuddyCnAccounts,
+    codebuddyCnRuntimeReady,
+    codebuddyRuntimeReady,
     codexAccounts,
+    codexRuntimeReady,
     currentAccount?.id,
     cursorAccounts,
     geminiAccounts,
     githubCopilotAccounts,
     kiroAccounts,
     qoderAccounts,
+    qoderRuntimeReady,
     selectedPlatform,
     traeAccounts,
     windsurfAccounts,
     workbuddyAccounts,
+    workbuddyRuntimeReady,
     zedAccounts,
   ]) as FloatingCardAccount | null;
   const viewedAccountId = viewedAccountIds[selectedPlatform] ?? null;
@@ -885,6 +991,8 @@ export function FloatingCardWindow() {
         return buildAntigravityAccountPresentation(viewedAccount as typeof agAccounts[number], displayGroups, t);
       case 'codex':
         return buildCodexAccountPresentation(viewedAccount as typeof codexAccounts[number], t);
+      case 'claude_manager':
+        return buildClaudeAccountPresentation(viewedAccount as typeof claudeAccounts[number], t);
       case 'github-copilot':
         return buildGitHubCopilotAccountPresentation(viewedAccount as typeof githubCopilotAccounts[number], t);
       case 'windsurf':
@@ -910,6 +1018,7 @@ export function FloatingCardWindow() {
     }
   }, [
     agAccounts,
+    claudeAccounts,
     codebuddyAccounts,
     codebuddyCnAccounts,
     codexAccounts,
@@ -919,6 +1028,7 @@ export function FloatingCardWindow() {
     githubCopilotAccounts,
     kiroAccounts,
     qoderAccounts,
+    qoderRuntimeReady,
     selectedPlatform,
     t,
     traeAccounts,
@@ -964,10 +1074,16 @@ export function FloatingCardWindow() {
       try {
         switch (selectedPlatform) {
           case 'antigravity':
-            await useAccountStore.getState().refreshQuota(viewedAccount.id);
+          case 'antigravity_ide':
+            await useAccountStore.getState().refreshQuota(viewedAccount.id, selectedPlatform);
             break;
           case 'codex':
+            if (!codexRuntimeReady) return;
             await useCodexAccountStore.getState().refreshQuota(viewedAccount.id);
+            break;
+          case 'claude_manager':
+            if (!claudeRuntimeReady) return;
+            await useClaudeAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'github-copilot':
             await useGitHubCopilotAccountStore.getState().refreshToken(viewedAccount.id);
@@ -985,18 +1101,22 @@ export function FloatingCardWindow() {
             await useGeminiAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'codebuddy':
+            if (!codebuddyRuntimeReady) return;
             await useCodebuddyAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'codebuddy_cn':
+            if (!codebuddyCnRuntimeReady) return;
             await useCodebuddyCnAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'qoder':
+            if (!qoderRuntimeReady) return;
             await useQoderAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'trae':
             await useTraeAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'workbuddy':
+            if (!workbuddyRuntimeReady) return;
             await useWorkbuddyAccountStore.getState().refreshToken(viewedAccount.id);
             break;
           case 'zed':
@@ -1018,7 +1138,7 @@ export function FloatingCardWindow() {
         }
       }
     },
-    [refreshingAccountId, selectedPlatform, switchingAccountId, t, viewedAccount],
+    [claudeRuntimeReady, codebuddyCnRuntimeReady, codebuddyRuntimeReady, codexRuntimeReady, qoderRuntimeReady, refreshingAccountId, selectedPlatform, switchingAccountId, t, viewedAccount, workbuddyRuntimeReady],
   );
 
   const handleRefresh = useCallback(async () => {
@@ -1070,17 +1190,18 @@ export function FloatingCardWindow() {
         switch (selectedPlatform) {
           case 'antigravity':
           case 'antigravity_ide':
-            await useAccountStore.getState().switchAccount(
-              viewedAccount.id,
-              selectedPlatform === 'antigravity_ide'
-                ? 'antigravity_ide'
-                : getAntigravityRuntimeTarget(),
-            );
-            await useAccountStore.getState().fetchCurrentAccount();
+            await useAccountStore.getState().switchAccount(viewedAccount.id, selectedPlatform);
+            await useAccountStore.getState().fetchCurrentAccount(selectedPlatform);
             break;
           case 'codex':
+            if (!codexRuntimeReady) return;
             await useCodexAccountStore.getState().switchAccount(viewedAccount.id);
             await useCodexAccountStore.getState().fetchCurrentAccount();
+            break;
+          case 'claude_manager':
+            if (!claudeRuntimeReady) return;
+            await useClaudeAccountStore.getState().switchAccount(viewedAccount.id);
+            await useClaudeAccountStore.getState().fetchCurrentAccountId();
             break;
           case 'github-copilot':
             await useGitHubCopilotAccountStore.getState().switchAccount(viewedAccount.id);
@@ -1098,18 +1219,22 @@ export function FloatingCardWindow() {
             await useGeminiAccountStore.getState().switchAccount(viewedAccount.id);
             break;
           case 'codebuddy':
+            if (!codebuddyRuntimeReady) return;
             await useCodebuddyAccountStore.getState().switchAccount(viewedAccount.id);
             break;
           case 'codebuddy_cn':
+            if (!codebuddyCnRuntimeReady) return;
             await useCodebuddyCnAccountStore.getState().switchAccount(viewedAccount.id);
             break;
           case 'qoder':
+            if (!qoderRuntimeReady) return;
             await useQoderAccountStore.getState().switchAccount(viewedAccount.id);
             break;
           case 'trae':
             await useTraeAccountStore.getState().switchAccount(viewedAccount.id);
             break;
           case 'workbuddy':
+            if (!workbuddyRuntimeReady) return;
             await useWorkbuddyAccountStore.getState().switchAccount(viewedAccount.id);
             break;
           case 'zed':
@@ -1119,9 +1244,26 @@ export function FloatingCardWindow() {
       }
       selectAccount(selectedPlatform, viewedAccount.id);
     } catch (error) {
+      const rawError = String(error).replace(/^Error:\s*/, '').trim();
+      if (rawError.startsWith('APP_PATH_NOT_FOUND:claude')) {
+        const detail = {
+          app: 'claude',
+          retry: { kind: 'switchAccount', accountId: viewedAccount.id },
+        };
+        await showMainWindowAndNavigate('claude');
+        await emit('app:path_missing', detail);
+        return;
+      }
+      const displayError =
+        rawError === 'CODEX_STALE_ACCOUNT'
+          ? t('codex.authError.staleAccount', {
+              defaultValue:
+                '该账号已不在本地账号库中，账号列表已刷新。请重新导入或重新登录该 Codex 账号。',
+            })
+          : rawError;
       setErrorText(
         t('floatingCard.errors.switchFailed', {
-          error: String(error),
+          error: displayError,
           defaultValue: '切换失败：{{error}}',
         }),
       );
@@ -1129,13 +1271,19 @@ export function FloatingCardWindow() {
       setSwitchingAccountId(null);
     }
   }, [
+    claudeRuntimeReady,
+    codebuddyCnRuntimeReady,
+    codebuddyRuntimeReady,
+    codexRuntimeReady,
     isCurrentViewed,
     instanceContext,
+    qoderRuntimeReady,
     selectAccount,
     selectedPlatform,
     switchingAccountId,
     t,
     viewedAccount,
+    workbuddyRuntimeReady,
   ]);
 
   const handleOpenDetails = useCallback(async () => {

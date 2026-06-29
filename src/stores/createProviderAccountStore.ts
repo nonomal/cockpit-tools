@@ -50,6 +50,7 @@ type ProviderStoreOptions = {
   resolveCurrentAccountId?: () => Promise<string | null>;
   persistCurrentAccountId?: boolean;
   hydrateCurrentAccountId?: boolean;
+  preserveSourceQuota?: boolean;
 };
 
 export interface ProviderAccountStoreState<TAccount> {
@@ -81,7 +82,6 @@ export function createProviderAccountStore<TAccount extends ProviderAccountAugme
     options?.persistCurrentAccountId ?? !hasCurrentAccountResolver;
   const shouldHydrateCurrentAccountId =
     options?.hydrateCurrentAccountId ?? shouldPersistCurrentAccountId;
-  let allowNextEmptyAccountList = false;
   let allowNextEmptyCurrentAccountId = false;
 
   const loadCachedAccounts = (): TAccount[] => {
@@ -178,7 +178,7 @@ export function createProviderAccountStore<TAccount extends ProviderAccountAugme
         ...account,
         email,
         plan_type: mapper.getPlanBadge(account),
-        quota,
+        quota: options.preserveSourceQuota ? account.quota : quota,
       };
     });
   };
@@ -244,20 +244,12 @@ export function createProviderAccountStore<TAccount extends ProviderAccountAugme
       set({ loading: true, error: null });
       try {
         const accounts = await service.listAccounts();
-        if (accounts.length === 0 && get().accounts.length > 0 && !allowNextEmptyAccountList) {
-          console.warn(`[Provider Store] 忽略异常空账号列表，保留本地缓存: ${cacheKey}`);
-          set({ loading: false });
-          return;
-        }
-        allowNextEmptyAccountList = false;
         const mapped = mapAccountsForUnifiedView(accounts);
         set({ accounts: mapped, loading: false });
         persistAccountsCache(mapped);
         await get().fetchCurrentAccountId();
       } catch (e) {
         set({ error: String(e), loading: false });
-      } finally {
-        allowNextEmptyAccountList = false;
       }
     },
 
@@ -265,9 +257,6 @@ export function createProviderAccountStore<TAccount extends ProviderAccountAugme
       if (accountIds.length === 0) return;
       const previousCurrentAccountId = get().currentAccountId;
       const deleteIdSet = new Set(accountIds);
-      allowNextEmptyAccountList = get().accounts.every((account) =>
-        deleteIdSet.has(account.id),
-      );
       allowNextEmptyCurrentAccountId = previousCurrentAccountId
         ? deleteIdSet.has(previousCurrentAccountId)
         : false;
@@ -291,7 +280,6 @@ export function createProviderAccountStore<TAccount extends ProviderAccountAugme
           });
         }
       } finally {
-        allowNextEmptyAccountList = false;
         allowNextEmptyCurrentAccountId = false;
       }
     },

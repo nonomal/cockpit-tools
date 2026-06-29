@@ -88,6 +88,15 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
+func codexWebsocketRetryDelay(cfg *config.Config, attempt int) time.Duration {
+	if cfg == nil {
+		return 0
+	}
+	base := time.Duration(cfg.Streaming.BootstrapRetryBaseDelayMS) * time.Millisecond
+	max := time.Duration(cfg.Streaming.BootstrapRetryMaxDelayMS) * time.Millisecond
+	return util.BackoffDelay(attempt, base, max)
+}
+
 type codexWebsocketRead struct {
 	conn    *websocket.Conn
 	msgType int
@@ -184,7 +193,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -194,8 +203,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -204,15 +212,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+	if helps.ShouldInjectImageGenerationTool(e.cfg, requestPath, opts.Headers) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
+	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -221,7 +230,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	clientBody := body
+	var identityState codexIdentityConfuseState
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -238,7 +252,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.reqMu.Unlock()
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
+	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -268,6 +282,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	reporter.StartResponseTTFT()
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 		defer func() {
@@ -296,9 +311,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
+			if errWait := util.SleepContext(ctx, codexWebsocketRetryDelay(e.cfg, 1)); errWait != nil {
+				return resp, errWait
+			}
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry == nil && connRetry != nil {
-				wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
+				wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
@@ -311,6 +329,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					AuthValue: authValue,
 				})
 				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+				reporter.StartResponseTTFT()
 				if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBody = wsReqBodyRetry
@@ -355,6 +374,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
+		reporter.MarkFirstResponseByte()
+		payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
@@ -372,7 +393,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				reporter.Publish(ctx, detail)
 			}
 			var param any
-			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
+			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
+			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, clientBody, clientPayload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil
 		}
@@ -394,12 +416,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
 	body := req.Payload
+	userPayload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		userPayload = opts.OriginalRequest
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -408,11 +434,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel, requestPath)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
 	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+	if helps.ShouldInjectImageGenerationTool(e.cfg, requestPath, opts.Headers) {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
+	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -421,7 +448,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	clientBody := body
+	var identityState codexIdentityConfuseState
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body)
+	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -437,7 +469,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
+	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -474,6 +506,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	reporter.StartResponseTTFT()
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -491,6 +524,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 
 			// Retry once with a new websocket connection for the same execution session.
+			if errWait := util.SleepContext(ctx, codexWebsocketRetryDelay(e.cfg, 1)); errWait != nil {
+				sess.clearActive(readCh)
+				sess.reqMu.Unlock()
+				return nil, errWait
+			}
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry != nil || connRetry == nil {
 				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
@@ -499,7 +537,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
-			wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
+			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -512,6 +550,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				AuthValue: authValue,
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+			reporter.StartResponseTTFT()
 			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
@@ -604,6 +643,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
+			reporter.MarkFirstResponseByte()
+			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
@@ -626,8 +667,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 			}
 
-			line := encodeCodexWebsocketAsSSE(payload)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
+			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
+			line := encodeCodexWebsocketAsSSE(clientPayload)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, clientBody, clientBody, line, &param)
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
@@ -810,21 +852,11 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 	}
 
 	var cache helps.CodexCache
-	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			if cached, ok := helps.GetCodexCache(key); ok {
-				cache = cached
-			} else {
-				cache = helps.CodexCache{
-					ID:     uuid.New().String(),
-					Expire: time.Now().Add(1 * time.Hour),
-				}
-				helps.SetCodexCache(key, cache)
-			}
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if cached, ok := codexClaudeCodePromptCache(req); ok {
+			cache = cached
 		}
-	} else if from == "openai-response" {
+	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
 			cache.ID = promptCacheKey.String()
 		}
@@ -860,6 +892,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	copyCodexAgtoolsDiagnosticHeaders(headers, ginHeaders)
 	if isAPIKey {
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {
@@ -874,10 +907,11 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
+	sessionFallback := ""
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", uuid.NewString())
+		sessionFallback = uuid.NewString()
 	}
-	ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", "")
+	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
@@ -900,6 +934,32 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
 
 	return headers
+}
+
+func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
+	if target == nil {
+		return
+	}
+	sessionID := codexSessionHeaderValue(target)
+	if sessionID == "" {
+		sessionID = codexSessionHeaderValue(source)
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(fallbackValue)
+	}
+	if sessionID != "" {
+		setHeaderCasePreserved(target, "session_id", sessionID)
+	}
+	deleteHeaderCaseInsensitive(target, "Session-Id")
+}
+
+func codexSessionHeaderValue(headers http.Header) string {
+	for _, key := range []string{"Session-Id", "Session_id", "session_id"} {
+		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
@@ -942,6 +1002,47 @@ func setHeaderCasePreserved(headers http.Header, key string, value string) {
 	}
 	deleteHeaderCaseInsensitive(headers, key)
 	headers[key] = []string{value}
+}
+
+func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string, value string) {
+	if headers == nil {
+		return
+	}
+	fallbackKey = strings.TrimSpace(fallbackKey)
+	value = strings.TrimSpace(value)
+	if fallbackKey == "" || value == "" {
+		return
+	}
+
+	selectedKey := ""
+	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
+		selectedKey = fallbackKey
+	} else {
+		for existingKey := range headers {
+			if codexSessionHeaderKeyUsesUnderscore(existingKey) {
+				selectedKey = existingKey
+				break
+			}
+		}
+	}
+	if selectedKey == "" {
+		selectedKey = fallbackKey
+	}
+	for existingKey := range headers {
+		if codexSessionHeaderKey(existingKey) && existingKey != selectedKey {
+			delete(headers, existingKey)
+		}
+	}
+	headers[selectedKey] = []string{value}
+}
+
+func codexSessionHeaderKey(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	return normalized == "session_id" || normalized == "session-id"
+}
+
+func codexSessionHeaderKeyUsesUnderscore(key string) bool {
+	return strings.ToLower(strings.TrimSpace(key)) == "session_id"
 }
 
 func headerValueCaseInsensitive(headers http.Header, key string) string {

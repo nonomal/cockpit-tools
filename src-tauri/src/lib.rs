@@ -7,6 +7,7 @@ mod utils;
 use modules::config::CloseWindowBehavior;
 use modules::logger;
 use std::sync::OnceLock;
+use std::time::Instant;
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 use tauri::RunEvent;
@@ -17,10 +18,183 @@ use tracing::info;
 
 /// 全局 AppHandle 存储
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+const SKIP_PLATFORM_ADAPTER_STARTUP_RESTORE_ENV: &str =
+    "COCKPIT_SKIP_PLATFORM_ADAPTER_STARTUP_RESTORE";
 
 /// 获取全局 AppHandle
 pub fn get_app_handle() -> Option<&'static tauri::AppHandle> {
     APP_HANDLE.get()
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+        .unwrap_or(false)
+}
+
+fn skip_platform_adapter_startup_restore() -> bool {
+    env_flag(SKIP_PLATFORM_ADAPTER_STARTUP_RESTORE_ENV)
+}
+
+fn restore_startup_platform_adapter_if_installed(
+    platform_id: &str,
+    restore: fn(),
+    restored: &mut Vec<String>,
+) {
+    let installed_check_started_at = Instant::now();
+    let installed = modules::platform_package::is_platform_package_installed(platform_id);
+    let installed_check_elapsed_ms = installed_check_started_at.elapsed().as_millis();
+    if !installed {
+        if installed_check_elapsed_ms >= 100 {
+            logger::log_info(&format!(
+                "[Startup][Perf] 平台 adapter 启动恢复跳过: platform={}, installed=false, installedCheck={}ms",
+                platform_id, installed_check_elapsed_ms
+            ));
+        }
+        return;
+    }
+
+    let restore_started_at = Instant::now();
+    restore();
+    let restore_elapsed_ms = restore_started_at.elapsed().as_millis();
+    logger::log_info(&format!(
+        "[Startup][Perf] 平台 adapter 启动恢复完成: platform={}, installedCheck={}ms, restore={}ms",
+        platform_id, installed_check_elapsed_ms, restore_elapsed_ms
+    ));
+    restored.push(platform_id.to_string());
+}
+
+fn restore_platform_adapters_on_startup() {
+    if skip_platform_adapter_startup_restore() {
+        logger::log_info(&format!(
+            "[Startup][Perf] 已跳过启动期平台 adapter 批量恢复: {}=1",
+            SKIP_PLATFORM_ADAPTER_STARTUP_RESTORE_ENV
+        ));
+        return;
+    }
+
+    let started_at = Instant::now();
+    let mut restored = Vec::new();
+    let restore_items: [(&str, fn()); 14] = [
+        ("codex", modules::platform_adapter::restore_codex_runtime),
+        ("zed", modules::platform_adapter::restore_zed_runtime),
+        ("kiro", modules::platform_adapter::restore_kiro_runtime),
+        (
+            "github-copilot",
+            modules::platform_adapter::restore_github_copilot_runtime,
+        ),
+        (
+            "windsurf",
+            modules::platform_adapter::restore_windsurf_runtime,
+        ),
+        ("cursor", modules::platform_adapter::restore_cursor_runtime),
+        ("gemini", modules::platform_adapter::restore_gemini_runtime),
+        ("trae", modules::platform_adapter::restore_trae_runtime),
+        ("qoder", modules::platform_adapter::restore_qoder_runtime),
+        (
+            "codebuddy",
+            modules::platform_adapter::restore_codebuddy_runtime,
+        ),
+        (
+            "codebuddy_cn",
+            modules::platform_adapter::restore_codebuddy_cn_runtime,
+        ),
+        (
+            "workbuddy",
+            modules::platform_adapter::restore_workbuddy_runtime,
+        ),
+        (
+            "antigravity",
+            modules::platform_adapter::restore_antigravity_runtime,
+        ),
+        (
+            "antigravity_ide",
+            modules::platform_adapter::restore_antigravity_ide_runtime,
+        ),
+    ];
+
+    for (platform_id, restore) in restore_items {
+        restore_startup_platform_adapter_if_installed(platform_id, restore, &mut restored);
+    }
+
+    logger::log_info(&format!(
+        "[Startup][Perf] 平台 adapter 启动恢复汇总: restored={}, platforms={}, elapsed={}ms",
+        restored.len(),
+        if restored.is_empty() {
+            "-".to_string()
+        } else {
+            restored.join(",")
+        },
+        started_at.elapsed().as_millis()
+    ));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn raise_process_file_descriptor_limit() {
+    const TARGET_NOFILE_LIMIT: libc::rlim_t = 4096;
+
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            logger::log_warn(&format!(
+                "[Startup] 读取进程文件句柄上限失败: {}",
+                std::io::Error::last_os_error()
+            ));
+            return;
+        }
+
+        let target = if limit.rlim_max == libc::RLIM_INFINITY {
+            TARGET_NOFILE_LIMIT
+        } else {
+            TARGET_NOFILE_LIMIT.min(limit.rlim_max)
+        };
+        if target <= limit.rlim_cur || target == 0 {
+            return;
+        }
+
+        let previous = limit.rlim_cur;
+        limit.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+            logger::log_info(&format!(
+                "[Startup] 已提升进程文件句柄软限制: {} -> {}",
+                previous, target
+            ));
+        } else {
+            logger::log_warn(&format!(
+                "[Startup] 提升进程文件句柄软限制失败: {} -> {}, error={}",
+                previous,
+                target,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn raise_process_file_descriptor_limit() {}
+
+fn apply_startup_minimized(app: &tauri::AppHandle) {
+    let config = modules::config::get_user_config();
+    if !config.startup_minimized {
+        return;
+    }
+
+    let Some(window) = app.get_webview_window("main") else {
+        logger::log_warn("[Window] 启动后自动最小化失败: main window not found");
+        return;
+    };
+
+    match window.minimize() {
+        Ok(()) => logger::log_info("[Window] 启动后已自动最小化主窗口"),
+        Err(err) => logger::log_warn(&format!("[Window] 启动后自动最小化失败: {}", err)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -54,6 +228,7 @@ fn apply_macos_activation_policy(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     logger::init_logger();
+    raise_process_file_descriptor_limit();
     // 启动时先加载一次配置，确保进程级代理环境与用户设置同步。
     let _ = modules::config::get_user_config();
 
@@ -162,27 +337,43 @@ pub fn run() {
                 modules::web_report::start_server().await;
             });
 
-            tauri::async_runtime::spawn(async {
-                modules::codex_local_access::restore_local_access_gateway().await;
-            });
-
             {
                 let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    modules::codex_oauth::restore_pending_oauth_listener(app_handle);
-                    modules::windsurf_oauth::restore_pending_oauth_listener();
-                    modules::kiro_oauth::restore_pending_oauth_listener();
-                    modules::trae_oauth::restore_pending_oauth_listener();
-                    modules::gemini_oauth::restore_pending_oauth_state();
-                    modules::zed_oauth::restore_pending_oauth_listener();
+                std::thread::spawn(move || {
+                    let startup_package_started_at = Instant::now();
+                    let bootstrap_started_at = Instant::now();
+                    match modules::platform_package::bootstrap_platform_packages_from_resources(
+                        &app_handle,
+                    ) {
+                        Ok(installed) if !installed.is_empty() => {
+                            logger::log_info(&format!(
+                                "[PlatformPackage] 启动 bootstrap 导入完成: platforms={}, elapsed={}ms",
+                                installed.join(","),
+                                bootstrap_started_at.elapsed().as_millis()
+                            ));
+                            let _ = modules::tray::update_tray_menu(&app_handle);
+                        }
+                        Ok(_) => {
+                            logger::log_info(&format!(
+                                "[PlatformPackage][Perf] 启动 bootstrap 无需导入: elapsed={}ms",
+                                bootstrap_started_at.elapsed().as_millis()
+                            ));
+                        }
+                        Err(error) => logger::log_warn(&format!(
+                            "[PlatformPackage] 启动 bootstrap 导入失败: elapsed={}ms, error={}",
+                            bootstrap_started_at.elapsed().as_millis(),
+                            error
+                        )),
+                    }
+                    restore_platform_adapters_on_startup();
+                    logger::log_info(&format!(
+                        "[Startup][Perf] 平台包启动后台任务完成: elapsed={}ms",
+                        startup_package_started_at.elapsed().as_millis()
+                    ));
                 });
             }
 
             modules::provider_token_keeper::ensure_started(app.handle().clone());
-            modules::wakeup_scheduler::restore_state_from_disk();
-            modules::wakeup_scheduler::ensure_started(app.handle().clone());
-            modules::codex_wakeup_scheduler::ensure_started(app.handle().clone());
-            modules::codex_wakeup_scheduler::trigger_startup_tasks_if_needed(app.handle().clone());
 
             #[cfg(target_os = "macos")]
             apply_macos_activation_policy(&app.handle());
@@ -288,6 +479,8 @@ pub fn run() {
                 startup_external_import_handled
             ));
 
+            apply_startup_minimized(&app.handle());
+
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -331,8 +524,6 @@ pub fn run() {
             commands::account::switch_account,
             commands::account::load_antigravity_switch_history,
             commands::account::clear_antigravity_switch_history,
-            commands::account::bind_account_fingerprint,
-            commands::account::get_bound_accounts,
             commands::account::update_account_tags,
             commands::account::update_account_notes,
             commands::account::load_account_groups,
@@ -340,27 +531,6 @@ pub fn run() {
             commands::account::sync_current_from_client,
             commands::account::sync_from_extension,
             // Device Commands
-            commands::device::get_device_profiles,
-            commands::device::bind_device_profile,
-            commands::device::bind_device_profile_with_profile,
-            commands::device::list_device_versions,
-            commands::device::restore_device_version,
-            commands::device::delete_device_version,
-            commands::device::restore_original_device,
-            commands::device::open_device_folder,
-            commands::device::preview_generate_profile,
-            commands::device::preview_current_profile,
-            // Fingerprint Commands
-            commands::device::list_fingerprints,
-            commands::device::get_fingerprint,
-            commands::device::generate_new_fingerprint,
-            commands::device::capture_current_fingerprint,
-            commands::device::create_fingerprint_with_profile,
-            commands::device::apply_fingerprint,
-            commands::device::delete_fingerprint,
-            commands::device::delete_unbound_fingerprints,
-            commands::device::rename_fingerprint,
-            commands::device::get_current_fingerprint_id,
             // OAuth Commands
             commands::oauth::start_oauth_login,
             commands::oauth::prepare_oauth_url,
@@ -369,8 +539,6 @@ pub fn run() {
             commands::oauth::cancel_oauth_login,
             // Import/Export Commands
             commands::import::import_from_old_tools,
-            commands::import::import_fingerprints_from_old_tools,
-            commands::import::import_fingerprints_from_json,
             commands::import::import_from_local,
             commands::import::import_from_json,
             commands::import::import_from_files,
@@ -380,6 +548,47 @@ pub fn run() {
             commands::data_transfer::data_transfer_get_instance_store,
             commands::data_transfer::data_transfer_replace_instance_store,
             commands::provider_current::get_provider_current_account_id,
+            // Claude Commands
+            commands::claude::list_claude_accounts,
+            commands::claude::delete_claude_account,
+            commands::claude::delete_claude_accounts,
+            commands::claude::import_claude_from_json,
+            commands::claude::import_claude_api_key,
+            commands::claude::import_claude_desktop_gateway,
+            commands::claude::update_claude_desktop_gateway,
+            commands::claude::claude_desktop_gateway_list_models,
+            commands::claude::claude_oauth_login_prepare,
+            commands::claude::claude_oauth_login_start,
+            commands::claude::claude_oauth_login_complete,
+            commands::claude::claude_oauth_login_cancel,
+            commands::claude::import_claude_cli_from_local,
+            commands::claude::claude_desktop_login_start,
+            commands::claude::claude_desktop_login_complete,
+            commands::claude::claude_desktop_login_cancel,
+            commands::claude::claude_open_verification_window,
+            commands::claude::export_claude_accounts,
+            commands::claude::refresh_claude_quota,
+            commands::claude::refresh_all_claude_quotas,
+            commands::claude::update_claude_account_tags,
+            commands::claude::update_claude_account_plan,
+            commands::claude::update_claude_account_note,
+            commands::claude::get_claude_accounts_index_path,
+            commands::claude::claude_get_cli_launch_command,
+            commands::claude::claude_execute_cli_launch_command,
+            commands::claude::claude_launch_cli,
+            commands::claude::switch_claude_account,
+            // Claude Instance Commands
+            commands::claude_instance::claude_get_instance_defaults,
+            commands::claude_instance::claude_list_instances,
+            commands::claude_instance::claude_create_instance,
+            commands::claude_instance::claude_update_instance,
+            commands::claude_instance::claude_delete_instance,
+            commands::claude_instance::claude_start_instance,
+            commands::claude_instance::claude_stop_instance,
+            commands::claude_instance::claude_open_instance_window,
+            commands::claude_instance::claude_close_all_instances,
+            commands::claude_instance::claude_get_instance_launch_command,
+            commands::claude_instance::claude_execute_instance_launch_command,
             // System Commands
             commands::system::open_data_folder,
             commands::system::save_text_file,
@@ -394,6 +603,13 @@ pub fn run() {
             commands::system::delete_auto_backup_file,
             commands::system::cleanup_auto_backup_files,
             commands::system::open_auto_backup_dir,
+            commands::system::get_webdav_sync_settings,
+            commands::system::save_webdav_sync_settings,
+            commands::system::test_webdav_sync_connection,
+            commands::system::upload_auto_backup_to_webdav,
+            commands::system::list_webdav_backup_files,
+            commands::system::read_webdav_backup_file,
+            commands::system::delete_webdav_backup_file,
             commands::system::get_network_config,
             commands::system::save_network_config,
             commands::system::get_general_config,
@@ -401,9 +617,11 @@ pub fn run() {
             commands::system::save_general_config,
             commands::system::save_tray_platform_layout,
             commands::system::set_app_path,
+            commands::system::set_claude_app_scan_roots,
             commands::system::set_codex_launch_on_switch,
             commands::system::set_codex_local_access_entry_visible,
             commands::system::detect_app_path,
+            commands::system::scan_claude_desktop_launch_targets,
             commands::system::get_antigravity_installed_version_info,
             commands::system::set_wakeup_override,
             commands::system::handle_window_close,
@@ -439,6 +657,9 @@ pub fn run() {
             commands::wakeup::wakeup_verification_load_history,
             commands::wakeup::wakeup_verification_delete_history,
             commands::wakeup::wakeup_verification_run_batch,
+            commands::wakeup::confirm_wakeup_task,
+            commands::wakeup::cancel_wakeup_task,
+            commands::wakeup::check_wakeup_timeouts,
             // Update Commands
             commands::update::should_check_updates,
             commands::update::update_last_check_time,
@@ -456,6 +677,10 @@ pub fn run() {
             commands::announcement::announcement_mark_all_as_read,
             commands::announcement::announcement_force_refresh,
             commands::announcement::announcement_get_top_right_ad,
+            commands::announcement::announcement_get_sponsor_module,
+            commands::announcement::announcement_force_refresh_sponsor_module,
+            commands::remote_config::remote_config_get_state,
+            commands::remote_config::remote_config_force_refresh,
             // Group Commands
             commands::group::get_group_settings,
             commands::group::save_group_settings,
@@ -485,7 +710,17 @@ pub fn run() {
             commands::codex::import_codex_from_json,
             commands::codex::export_codex_accounts,
             commands::codex::import_codex_from_files,
+            commands::codex::start_codex_batch_import_from_files,
+            commands::codex::cancel_codex_batch_import,
+            commands::codex::resume_codex_batch_import,
+            commands::codex::get_codex_batch_import_preview,
+            commands::codex::confirm_codex_batch_import,
             commands::codex::refresh_codex_quota,
+            commands::codex::get_codex_reset_credits,
+            commands::codex::consume_codex_reset_credit,
+            commands::codex::get_codex_referral_invite_eligibility,
+            commands::codex::get_codex_referral_eligibility_rules,
+            commands::codex::send_codex_referral_invites,
             commands::codex::refresh_codex_subscription_info,
             commands::codex::refresh_all_codex_quotas,
             commands::codex::refresh_current_codex_quota,
@@ -518,6 +753,10 @@ pub fn run() {
             commands::codex::save_codex_account_groups,
             commands::codex::load_codex_model_providers,
             commands::codex::save_codex_model_providers,
+            commands::codex::codex_test_model_provider_connection,
+            commands::codex::codex_model_provider_chat_test_batch,
+            commands::codex::codex_list_model_provider_models,
+            commands::codex::codex_query_model_provider_usage,
             commands::codex::codex_local_access_get_state,
             commands::codex::codex_local_access_save_accounts,
             commands::codex::codex_local_access_remove_account,
@@ -530,13 +769,17 @@ pub fn run() {
             commands::codex::codex_local_access_update_port,
             commands::codex::codex_local_access_update_routing_strategy,
             commands::codex::codex_local_access_update_custom_routing,
+            commands::codex::codex_local_access_update_account_model_rules,
             commands::codex::codex_local_access_update_model_rules,
             commands::codex::codex_local_access_update_model_pricings,
             commands::codex::codex_local_access_update_routing_options,
+            commands::codex::codex_local_access_update_timeouts,
+            commands::codex::codex_local_access_update_timeout_presets,
             commands::codex::codex_local_access_update_upstream_proxy_config,
             commands::codex::codex_local_access_update_gateway_mode,
             commands::codex::codex_local_access_update_debug_logs,
             commands::codex::codex_local_access_update_access_scope,
+            commands::codex::codex_local_access_update_client_base_url_host,
             commands::codex::codex_local_access_update_image_generation_mode,
             commands::codex::codex_local_access_create_api_key,
             commands::codex::codex_local_access_update_api_key,
@@ -545,6 +788,8 @@ pub fn run() {
             commands::codex::codex_local_access_set_enabled,
             commands::codex::codex_local_access_activate,
             commands::codex::codex_local_access_test,
+            commands::codex::codex_local_access_chat_test,
+            commands::codex::codex_local_access_chat_test_stream,
             // GitHub Copilot Commands
             commands::github_copilot::list_github_copilot_accounts,
             commands::github_copilot::delete_github_copilot_account,
@@ -727,6 +972,16 @@ pub fn run() {
             commands::zed::zed_stop_default_session,
             commands::zed::zed_restart_default_session,
             commands::zed::zed_focus_default_session,
+            // Platform Package Commands
+            commands::platform_package::list_platform_packages,
+            commands::platform_package::check_platform_package_update,
+            commands::platform_package::prepare_platform_package_updates,
+            commands::platform_package::install_platform_package,
+            commands::platform_package::update_platform_package,
+            commands::platform_package::reload_platform_package,
+            commands::platform_package::uninstall_platform_package,
+            commands::platform_package::get_platform_package_ui_entry,
+            commands::platform_package::get_platform_ui_dev_config,
             // Qoder Instance Commands
             commands::qoder_instance::qoder_get_instance_defaults,
             commands::qoder_instance::qoder_list_instances,
@@ -848,6 +1103,8 @@ pub fn run() {
             commands::codex_instance::codex_sync_threads_across_instances,
             commands::codex_instance::codex_sync_sessions_to_instance,
             commands::codex_instance::codex_repair_session_visibility_across_instances,
+            commands::codex_instance::codex_list_session_visibility_repair_providers,
+            commands::codex_instance::codex_list_session_visibility_repair_instances,
             commands::codex_instance::codex_list_sessions_across_instances,
             commands::codex_instance::codex_get_session_token_stats_across_instances,
             commands::codex_instance::codex_move_sessions_to_trash_across_instances,
@@ -872,6 +1129,15 @@ pub fn run() {
             commands::instance::stop_instance,
             commands::instance::open_instance_window,
             commands::instance::close_all_instances,
+            commands::antigravity_legacy_instance::antigravity_legacy_get_instance_defaults,
+            commands::antigravity_legacy_instance::antigravity_legacy_list_instances,
+            commands::antigravity_legacy_instance::antigravity_legacy_create_instance,
+            commands::antigravity_legacy_instance::antigravity_legacy_update_instance,
+            commands::antigravity_legacy_instance::antigravity_legacy_delete_instance,
+            commands::antigravity_legacy_instance::antigravity_legacy_start_instance,
+            commands::antigravity_legacy_instance::antigravity_legacy_stop_instance,
+            commands::antigravity_legacy_instance::antigravity_legacy_open_instance_window,
+            commands::antigravity_legacy_instance::antigravity_legacy_close_all_instances,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -879,9 +1145,7 @@ pub fn run() {
     app.run(|app_handle, event| {
         match &event {
             RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-                tauri::async_runtime::block_on(async {
-                    modules::codex_local_access::shutdown_local_access_gateway_for_app_exit().await;
-                });
+                modules::platform_adapter::shutdown_codex_runtime_for_app_exit();
             }
             _ => {}
         }

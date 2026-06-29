@@ -9,6 +9,7 @@ mod imp {
     use std::cmp::Ordering;
     use std::collections::{HashMap, HashSet};
     use std::ffi::{c_char, c_void, CStr, CString};
+    use std::time::Duration;
 
     use objc2::rc::Retained;
     use serde::Serialize;
@@ -37,6 +38,9 @@ mod imp {
         quit: String,
         empty_title: String,
         empty_desc: String,
+        package_install_required: String,
+        package_install_desc: String,
+        package_install_and_open: String,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -53,6 +57,7 @@ mod imp {
         short_title: String,
         nav_target: String,
         accent_hex: String,
+        runtime_ready: bool,
         current_account_id: Option<String>,
         recommended_account_id: Option<String>,
         cards: Vec<RenderedAccountCard>,
@@ -341,8 +346,12 @@ mod imp {
     }
 
     fn build_platform_snapshot(platform: PlatformId, lang: &str) -> PlatformSnapshot {
-        let (cards, current_account_id, recommended_account_id) =
-            build_platform_cards(platform, lang);
+        let runtime_ready = platform.runtime_ready();
+        let (cards, current_account_id, recommended_account_id) = if runtime_ready {
+            build_platform_cards(platform, lang)
+        } else {
+            (Vec::new(), None, None)
+        };
         let cards = cards
             .into_iter()
             .map(|card| RenderedAccountCard {
@@ -360,6 +369,7 @@ mod imp {
             short_title: switcher_title(platform).to_string(),
             nav_target: platform.nav_target().to_string(),
             accent_hex: platform_accent_hex(platform).to_string(),
+            runtime_ready,
             current_account_id,
             recommended_account_id,
             cards,
@@ -395,6 +405,21 @@ mod imp {
             quit: modules::i18n::translate(lang, "closeDialog.quit", &[]),
             empty_title: modules::i18n::translate(lang, "floatingCard.empty.title", &[]),
             empty_desc: modules::i18n::translate(lang, "floatingCard.empty.desc", &[]),
+            package_install_required: modules::i18n::translate(
+                lang,
+                "platformLayout.packageInstallRequired",
+                &[],
+            ),
+            package_install_desc: modules::i18n::translate(
+                lang,
+                "platformLayout.packageInstallCardDesc",
+                &[("version", "--"), ("size", "--")],
+            ),
+            package_install_and_open: modules::i18n::translate(
+                lang,
+                "platformLayout.packageInstallAndOpen",
+                &[],
+            ),
         }
     }
 
@@ -411,6 +436,7 @@ mod imp {
         match platform {
             PlatformId::Antigravity => "#67c27b",
             PlatformId::Codex => "#1976ff",
+            PlatformId::Claude => "#d97745",
             PlatformId::Zed => "#8b92a1",
             PlatformId::GitHubCopilot => "#8b92a1",
             PlatformId::Windsurf => "#21c7b7",
@@ -453,11 +479,17 @@ mod imp {
         match action.as_str() {
             "refresh" => {
                 if let Some(platform) = platform {
+                    if !platform.runtime_ready() {
+                        return;
+                    }
                     spawn_refresh(platform, account_id);
                 }
             }
             "switch" => {
                 if let (Some(platform), Some(account_id)) = (platform, account_id) {
+                    if !platform.runtime_ready() {
+                        return;
+                    }
                     spawn_switch_account(platform, account_id);
                 }
             }
@@ -646,6 +678,23 @@ mod imp {
         format!("${:.2}", value.max(0.0))
     }
 
+    fn format_provider_usage_money(value: f64, unit: Option<&str>) -> String {
+        let normalized_unit = unit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("USD");
+        let amount = if value >= 100.0 {
+            format!("{:.0}", value)
+        } else {
+            format!("{:.2}", value)
+        };
+        if normalized_unit.eq_ignore_ascii_case("USD") {
+            format!("${amount}")
+        } else {
+            format!("{amount} {normalized_unit}")
+        }
+    }
+
     fn format_currency_cents(value: f64) -> String {
         format!("${:.2}", (value / 100.0).max(0.0))
     }
@@ -760,6 +809,213 @@ mod imp {
             progress_tone: None,
             subtext,
         }
+    }
+
+    fn codex_api_key_provider_usage(
+        account: &crate::models::codex::CodexAccount,
+    ) -> Option<&Value> {
+        account
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.raw_data.as_ref())
+            .and_then(|raw| json_path(Some(raw), &["provider_usage"]))
+    }
+
+    fn codex_api_key_usage_detail<'a>(summary: &'a Value, key: &str) -> Option<&'a Value> {
+        summary
+            .get("details")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|item| item.get("key").and_then(Value::as_str).map(str::trim) == Some(key))
+    }
+
+    fn codex_api_key_usage_detail_number(summary: &Value, key: &str) -> Option<f64> {
+        codex_api_key_usage_detail(summary, key)?
+            .get("value")
+            .and_then(parse_json_number)
+    }
+
+    fn format_provider_usage_count(value: f64) -> String {
+        format_quota_number(value.max(0.0))
+    }
+
+    fn format_provider_usage_count_opt(value: Option<f64>) -> String {
+        value
+            .map(format_provider_usage_count)
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    fn build_codex_api_key_usage_rows(
+        lang: &str,
+        account: &crate::models::codex::CodexAccount,
+    ) -> Vec<QuotaRow> {
+        let Some(summary) = codex_api_key_provider_usage(account) else {
+            return vec![make_text_row(
+                translate_or(lang, "common.shared.quota.noData", "No quota data", &[]),
+                "-".to_string(),
+                Some(modules::i18n::translate(lang, "common.refresh", &[])),
+            )];
+        };
+        let mode = json_path(Some(summary), &["mode"])
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let unit = json_path(Some(summary), &["unit"]).and_then(Value::as_str);
+        let has_new_api_fields = codex_api_key_usage_detail(summary, "totalGranted").is_some()
+            || codex_api_key_usage_detail(summary, "totalAvailable").is_some()
+            || codex_api_key_usage_detail(summary, "expiresAt").is_some();
+        if mode == "new_api" || has_new_api_fields {
+            let total_granted = codex_api_key_usage_detail_number(summary, "totalGranted");
+            let total_available = codex_api_key_usage_detail_number(summary, "totalAvailable");
+            let expires_at = codex_api_key_usage_detail(summary, "expiresAt")
+                .and_then(|item| item.get("value"))
+                .and_then(parse_timestamp_like);
+            let mut rows = Vec::new();
+            rows.push(make_text_row(
+                translate_or(lang, "codex.modelProviders.usage.limit", "Total", &[]),
+                format_provider_usage_count_opt(total_granted),
+                None,
+            ));
+            let used_percent = match (total_granted, total_available) {
+                (Some(granted), Some(available)) if granted > 0.0 => {
+                    clamp_percent(((granted - available).max(0.0) / granted) * 100.0)
+                }
+                _ => 0,
+            };
+            rows.push(QuotaRow {
+                label: translate_or(
+                    lang,
+                    "codex.modelProviders.usage.remaining",
+                    "Remaining",
+                    &[],
+                ),
+                value: format_provider_usage_count_opt(total_available),
+                progress: Some(used_percent),
+                progress_tone: Some(usage_warning_tone(used_percent)),
+                subtext: None,
+            });
+            rows.push(make_text_row(
+                translate_or(
+                    lang,
+                    "codex.modelProviders.usage.fields.expiresAt",
+                    "Expires At",
+                    &[],
+                ),
+                expires_at
+                    .and_then(|value| format_reset_subtext(lang, Some(value)))
+                    .unwrap_or_else(|| "-".to_string()),
+                None,
+            ));
+            return rows;
+        }
+        let sub2api_remaining = json_path(Some(summary), &["quotaRemaining"])
+            .or_else(|| json_path(Some(summary), &["remaining"]))
+            .or_else(|| json_path(Some(summary), &["balance"]))
+            .and_then(parse_json_number);
+        let sub2api_today_requests =
+            json_path(Some(summary), &["todayRequests"]).and_then(parse_json_number);
+        let sub2api_today_tokens =
+            json_path(Some(summary), &["todayTotalTokens"]).and_then(parse_json_number);
+        let has_sub2api_fields = sub2api_remaining.is_some()
+            || sub2api_today_requests.is_some()
+            || sub2api_today_tokens.is_some();
+        if mode == "sub2api" || has_sub2api_fields {
+            return vec![
+                make_text_row(
+                    translate_or(
+                        lang,
+                        "codex.modelProviders.usage.remaining",
+                        "Remaining",
+                        &[],
+                    ),
+                    sub2api_remaining
+                        .map(|value| format_provider_usage_money(value, unit))
+                        .unwrap_or_else(|| "-".to_string()),
+                    None,
+                ),
+                make_text_row(
+                    translate_or(
+                        lang,
+                        "codex.modelProviders.usage.fields.todayRequests",
+                        "Today Requests",
+                        &[],
+                    ),
+                    format_provider_usage_count_opt(sub2api_today_requests),
+                    None,
+                ),
+                make_text_row(
+                    translate_or(
+                        lang,
+                        "codex.modelProviders.usage.fields.todayTokens",
+                        "Today Tokens",
+                        &[],
+                    ),
+                    format_provider_usage_count_opt(sub2api_today_tokens),
+                    None,
+                ),
+            ];
+        }
+        let quota_unlimited = json_path(Some(summary), &["quotaUnlimited"])
+            .and_then(json_bool)
+            .unwrap_or(false);
+        let remaining = json_path(Some(summary), &["quotaRemaining"])
+            .or_else(|| json_path(Some(summary), &["remaining"]))
+            .or_else(|| json_path(Some(summary), &["balance"]))
+            .and_then(parse_json_number);
+        let balance = json_path(Some(summary), &["balance"]).and_then(parse_json_number);
+        let used = json_path(Some(summary), &["quotaUsed"])
+            .or_else(|| json_path(Some(summary), &["totalCost"]))
+            .and_then(parse_json_number);
+        let limit = json_path(Some(summary), &["quotaLimit"]).and_then(parse_json_number);
+        let percent = match (used, limit) {
+            (Some(used), Some(limit)) if limit > 0.0 => Some(clamp_percent((used / limit) * 100.0)),
+            _ => None,
+        };
+        let mut rows = Vec::new();
+        if quota_unlimited || remaining.is_some() || limit.is_some() || used.is_some() {
+            let value = if quota_unlimited {
+                translate_or(
+                    lang,
+                    "codex.modelProviders.usage.unlimitedQuota",
+                    "Unlimited",
+                    &[],
+                )
+            } else {
+                remaining
+                    .or(limit)
+                    .map(|value| format_provider_usage_money(value, unit))
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let subtext = used.map(|value| {
+                let used_label = translate_or(lang, "codex.modelProviders.usage.used", "Used", &[]);
+                format!("{used_label}: {}", format_provider_usage_money(value, unit))
+            });
+            rows.push(QuotaRow {
+                label: translate_or(
+                    lang,
+                    "codex.modelProviders.usage.remaining",
+                    "Remaining",
+                    &[],
+                ),
+                value,
+                progress: Some(percent.unwrap_or(0)),
+                progress_tone: Some(usage_warning_tone(percent.unwrap_or(0))),
+                subtext,
+            });
+        }
+        if let Some(balance) = balance {
+            rows.push(make_text_row(
+                translate_or(
+                    lang,
+                    "codex.modelProviders.usage.accountBalance",
+                    "Account Balance",
+                    &[],
+                ),
+                format_provider_usage_money(balance, unit),
+                None,
+            ));
+        }
+        rows
     }
 
     fn json_path<'a>(root: Option<&'a Value>, path: &[&str]) -> Option<&'a Value> {
@@ -1325,16 +1581,34 @@ mod imp {
         key: &str,
     ) -> Option<&'a serde_json::Map<String, Value>> {
         let snapshots = quota_snapshots.and_then(|value| value.as_object())?;
-        let primary = snapshots.get(key).and_then(|snapshot| snapshot.as_object());
-        if primary.is_some() {
-            return primary;
-        }
-        if key == "premium_interactions" {
+        if matches!(key, "premium_models" | "premium_interactions") {
             return snapshots
                 .get("premium_models")
+                .or_else(|| snapshots.get("premium_interactions"))
                 .and_then(|snapshot| snapshot.as_object());
         }
-        None
+        snapshots.get(key).and_then(|snapshot| snapshot.as_object())
+    }
+
+    fn snapshot_without_displayable_quota(
+        snapshot: Option<&serde_json::Map<String, Value>>,
+    ) -> bool {
+        let Some(data) = snapshot else {
+            return false;
+        };
+        if data.get("unlimited").and_then(|value| value.as_bool()) == Some(true) {
+            return false;
+        }
+
+        let entitlement = data.get("entitlement").and_then(parse_json_number);
+        if entitlement.map(|value| value < 0.0).unwrap_or(false) {
+            return false;
+        }
+        if let Some(value) = entitlement {
+            return value <= 0.0;
+        }
+
+        data.get("has_quota").and_then(|value| value.as_bool()) == Some(false)
     }
 
     fn entitlement_from_snapshot(snapshot: Option<&serde_json::Map<String, Value>>) -> Option<f64> {
@@ -1345,6 +1619,10 @@ mod imp {
     }
 
     fn remaining_from_snapshot(snapshot: Option<&serde_json::Map<String, Value>>) -> Option<f64> {
+        if snapshot_without_displayable_quota(snapshot) {
+            return None;
+        }
+
         if let Some(remaining) = snapshot
             .and_then(|data| data.get("remaining"))
             .and_then(parse_json_number)
@@ -1389,6 +1667,9 @@ mod imp {
             == Some(true)
         {
             return Some(0);
+        }
+        if snapshot_without_displayable_quota(snapshot) {
+            return None;
         }
 
         let entitlement = snapshot
@@ -1907,31 +2188,36 @@ mod imp {
         let Some(raw_usage) = account.gemini_usage_raw.as_ref() else {
             return Vec::new();
         };
-        let Some(buckets) = raw_usage.get("buckets").and_then(|value| value.as_array()) else {
+        let Some(groups) = raw_usage.get("groups").and_then(|value| value.as_array()) else {
             return Vec::new();
         };
 
         let mut values = Vec::new();
-        for bucket in buckets {
-            let model_id = bucket
-                .get("modelId")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let remaining = bucket
-                .get("remainingFraction")
-                .and_then(parse_json_number)
-                .map(|value| clamp_percent(value * 100.0));
-            let reset_at = bucket.get("resetTime").and_then(parse_timestamp_like);
-            let (Some(model_id), Some(remaining_percent)) = (model_id, remaining) else {
+        for group in groups {
+            let Some(buckets) = group.get("buckets").and_then(|value| value.as_array()) else {
                 continue;
             };
-            values.push(GeminiBucketRemaining {
-                model_id,
-                remaining_percent,
-                reset_at,
-            });
+            for bucket in buckets {
+                let model_id = bucket
+                    .get("bucketId")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let remaining = bucket
+                    .get("remainingFraction")
+                    .and_then(parse_json_number)
+                    .map(|value| clamp_percent(value * 100.0));
+                let reset_at = bucket.get("resetTime").and_then(parse_timestamp_like);
+                let (Some(model_id), Some(remaining_percent)) = (model_id, remaining) else {
+                    continue;
+                };
+                values.push(GeminiBucketRemaining {
+                    model_id,
+                    remaining_percent,
+                    reset_at,
+                });
+            }
         }
 
         values.sort_by(|left, right| left.model_id.cmp(&right.model_id));
@@ -2637,6 +2923,7 @@ mod imp {
         match platform {
             PlatformId::Antigravity => build_antigravity_cards(lang),
             PlatformId::Codex => build_codex_cards(lang),
+            PlatformId::Claude => build_claude_cards(lang, true),
             PlatformId::GitHubCopilot => build_ghcp_cards(lang),
             PlatformId::Windsurf => build_windsurf_cards(lang),
             PlatformId::Kiro => build_kiro_cards(lang),
@@ -2652,19 +2939,63 @@ mod imp {
     }
 
     fn build_antigravity_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let accounts = modules::account::list_accounts().unwrap_or_default();
-        let current_id = modules::account::get_current_account()
-            .ok()
-            .flatten()
-            .map(|account| account.id);
+        if !PlatformId::Antigravity.runtime_ready() {
+            return (Vec::new(), None, None);
+        }
 
-        let mut sorted = accounts;
+        let mut sorted = modules::platform_adapter::call_antigravity_series_with_timeout::<
+            Vec<crate::models::Account>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_antigravity_series_with_timeout::<
+            Option<crate::models::Account>,
+        >(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten()
+        .map(|account| account.id);
+
         sorted.sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
 
-        let recommended = current_id
-            .as_deref()
-            .and_then(|id| modules::account::pick_quota_alert_recommendation(&sorted, id))
-            .map(|account| account.id);
+        let recommended = current_id.as_deref().and_then(|id| {
+            sorted
+                .iter()
+                .filter(|account| account.id != id && !account.disabled && account.quota.is_some())
+                .max_by(|left, right| {
+                    let score_left = left
+                        .quota
+                        .as_ref()
+                        .and_then(|quota| {
+                            let total: i32 =
+                                quota.models.iter().map(|model| model.percentage).sum();
+                            (!quota.models.is_empty())
+                                .then_some(total as f64 / quota.models.len() as f64)
+                        })
+                        .unwrap_or(-1.0);
+                    let score_right = right
+                        .quota
+                        .as_ref()
+                        .and_then(|quota| {
+                            let total: i32 =
+                                quota.models.iter().map(|model| model.percentage).sum();
+                            (!quota.models.is_empty())
+                                .then_some(total as f64 / quota.models.len() as f64)
+                        })
+                        .unwrap_or(-1.0);
+                    score_left
+                        .partial_cmp(&score_right)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| right.last_used.cmp(&left.last_used))
+                })
+                .map(|account| account.id.clone())
+        });
 
         let cards = sorted
             .into_iter()
@@ -2688,8 +3019,25 @@ mod imp {
     }
 
     fn build_codex_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::codex_account::list_accounts();
-        let current_id = modules::codex_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_runtime_ready("codex") {
+            return (Vec::new(), None, None);
+        }
+
+        let mut accounts = modules::platform_adapter::call_codex_with_timeout::<
+            Vec<crate::models::codex::CodexAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_codex_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
 
@@ -2717,7 +3065,9 @@ mod imp {
             .into_iter()
             .map(|account| {
                 let mut rows = Vec::new();
-                if let Some(quota) = account.quota.as_ref() {
+                if account.is_api_key_auth() {
+                    rows = build_codex_api_key_usage_rows(lang, &account);
+                } else if let Some(quota) = account.quota.as_ref() {
                     let has_presence_flags = quota.hourly_window_present.is_some()
                         || quota.weekly_window_present.is_some();
                     if !has_presence_flags || quota.hourly_window_present == Some(true) {
@@ -2800,9 +3150,157 @@ mod imp {
         (cards, current_id, recommended)
     }
 
+    fn is_claude_desktop_account(account: &crate::models::claude::ClaudeAccount) -> bool {
+        matches!(
+            account.auth_mode,
+            crate::models::claude::ClaudeAuthMode::DesktopOAuth
+                | crate::models::claude::ClaudeAuthMode::DesktopGateway
+        )
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ClaudeCurrentAccounts {
+        desktop_account_id: Option<String>,
+        code_account_id: Option<String>,
+    }
+
+    fn build_claude_cards(
+        lang: &str,
+        desktop: bool,
+    ) -> (Vec<AccountCard>, Option<String>, Option<String>) {
+        let fallback_title = if desktop { "Claude" } else { "Claude CLI" };
+        let mut accounts =
+            if modules::platform_package::is_platform_package_installed("claude_manager") {
+                modules::platform_adapter::call_claude_manager_with_timeout::<
+                    Vec<crate::models::claude::ClaudeAccount>,
+                >(
+                    "accounts.list",
+                    serde_json::json!({}),
+                    std::time::Duration::from_secs(20),
+                )
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+            .into_iter()
+            .filter(|account| is_claude_desktop_account(account) == desktop)
+            .collect::<Vec<_>>();
+        let current =
+            modules::platform_adapter::call_claude_manager_with_timeout::<ClaudeCurrentAccounts>(
+                "accounts.current",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(20),
+            )
+            .unwrap_or_default();
+        let current_id = if desktop {
+            current.desktop_account_id
+        } else {
+            current.code_account_id
+        };
+        accounts
+            .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
+
+        let recommended = current_id.as_deref().and_then(|id| {
+            accounts
+                .iter()
+                .filter(|account| account.id != id)
+                .filter_map(|account| {
+                    let quota = account.quota.as_ref()?;
+                    let values = [quota.five_hour_percentage, quota.seven_day_percentage];
+                    let avg = values.iter().copied().sum::<i32>() as f64 / values.len() as f64;
+                    Some((account.id.clone(), avg, account.last_used))
+                })
+                .min_by(|left, right| {
+                    left.1
+                        .partial_cmp(&right.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| right.2.cmp(&left.2))
+                })
+                .map(|item| item.0)
+        });
+
+        let cards = accounts
+            .into_iter()
+            .map(|account| {
+                let mut rows = Vec::new();
+                if let Some(quota) = account.quota.as_ref() {
+                    let five_hour = quota.five_hour_percentage.clamp(0, 100);
+                    rows.push(make_progress_row(
+                        translate_or(lang, "claude.quota.fiveHour", "Current session", &[]),
+                        format!("{five_hour}%"),
+                        five_hour,
+                        format_reset_subtext(lang, quota.five_hour_reset_time),
+                        usage_warning_tone(five_hour),
+                    ));
+
+                    let seven_day = quota.seven_day_percentage.clamp(0, 100);
+                    rows.push(make_progress_row(
+                        translate_or(
+                            lang,
+                            "claude.quota.sevenDay",
+                            "Current week (all models)",
+                            &[],
+                        ),
+                        format!("{seven_day}%"),
+                        seven_day,
+                        format_reset_subtext(lang, quota.seven_day_reset_time),
+                        usage_warning_tone(seven_day),
+                    ));
+                } else if let Some(error) = account.quota_error.as_ref() {
+                    rows.push(make_text_row(
+                        translate_or(lang, "common.shared.columns.status", "Status", &[]),
+                        error.message.clone(),
+                        None,
+                    ));
+                }
+
+                AccountCard {
+                    id: account.id,
+                    title: first_non_empty(&[
+                        Some(account.email.as_str()),
+                        account.organization_name.as_deref(),
+                    ])
+                    .unwrap_or(fallback_title)
+                    .to_string(),
+                    plan: first_non_empty(&[
+                        account.plan_type.as_deref(),
+                        account.organization_name.as_deref(),
+                    ])
+                    .map(str::to_string),
+                    updated_at: display_updated_at(
+                        account.usage_updated_at,
+                        account.last_used,
+                        account.created_at,
+                    ),
+                    quota_rows: rows,
+                }
+            })
+            .collect();
+
+        (cards, current_id, recommended)
+    }
+
     fn build_ghcp_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::github_copilot_account::list_accounts();
-        let current_id = modules::github_copilot_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("github-copilot") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = modules::platform_adapter::call_github_copilot_with_timeout::<
+            Vec<crate::models::github_copilot::GitHubCopilotAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let current_id =
+            modules::platform_adapter::call_github_copilot_with_timeout::<Option<String>>(
+                "accounts.current",
+                serde_json::json!({}),
+                Duration::from_secs(20),
+            )
+            .ok()
+            .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let recommended = current_id.as_deref().and_then(|id| {
@@ -2810,12 +3308,27 @@ mod imp {
                 .iter()
                 .filter(|account| account.id != id)
                 .filter_map(|account| {
-                    let metrics = modules::github_copilot_account::extract_quota_metrics(account);
+                    let usage = compute_copilot_usage(
+                        &account.copilot_token,
+                        account.copilot_plan.as_deref(),
+                        account.copilot_limited_user_quotas.as_ref(),
+                        account.copilot_quota_snapshots.as_ref(),
+                        account.copilot_limited_user_reset_date,
+                        account.copilot_quota_reset_date.as_deref(),
+                    );
+                    let metrics: Vec<i32> = [
+                        usage.inline.used_percent,
+                        usage.chat.used_percent,
+                        usage.premium.used_percent,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|used| 100 - used.clamp(0, 100))
+                    .collect();
                     if metrics.is_empty() {
                         return None;
                     }
-                    let avg = metrics.iter().map(|(_, pct)| *pct).sum::<i32>() as f64
-                        / metrics.len() as f64;
+                    let avg = metrics.iter().sum::<i32>() as f64 / metrics.len() as f64;
                     Some((account.id.clone(), avg, account.last_used))
                 })
                 .max_by(|left, right| {
@@ -2893,8 +3406,24 @@ mod imp {
     }
 
     fn build_windsurf_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::windsurf_account::list_accounts();
-        let current_id = modules::windsurf_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("windsurf") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = modules::platform_adapter::call_windsurf_with_timeout::<
+            Vec<crate::models::windsurf::WindsurfAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_windsurf_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let recommended = current_id.as_deref().and_then(|id| {
@@ -2902,13 +3431,31 @@ mod imp {
                 .iter()
                 .filter(|account| account.id != id)
                 .filter_map(|account| {
-                    let metrics = modules::windsurf_account::extract_quota_metrics(account);
-                    if metrics.is_empty() {
-                        return None;
-                    }
-                    let avg = metrics.iter().map(|(_, pct)| *pct).sum::<i32>() as f64
-                        / metrics.len() as f64;
-                    Some((account.id.clone(), avg, account.last_used))
+                    let score = match resolve_windsurf_usage_mode(account) {
+                        WindsurfUsageMode::Quota => {
+                            let summary = resolve_windsurf_quota_usage_summary(account);
+                            let values = [summary.daily_used_percent, summary.weekly_used_percent]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>();
+                            if values.is_empty() {
+                                return None;
+                            }
+                            100.0
+                                - values.iter().map(|value| *value as f64).sum::<f64>()
+                                    / values.len() as f64
+                        }
+                        WindsurfUsageMode::Credits => {
+                            let summary = resolve_windsurf_credits_summary(account);
+                            summary
+                                .prompt_left
+                                .map(|prompt_left| {
+                                    prompt_left * 1000.0 + summary.add_on_left.unwrap_or_default()
+                                })
+                                .or(summary.credits_left)?
+                        }
+                    };
+                    Some((account.id.clone(), score, account.last_used))
                 })
                 .max_by(|left, right| {
                     left.1
@@ -3087,23 +3634,67 @@ mod imp {
         (cards, current_id, recommended)
     }
 
+    fn is_kiro_banned_account(account: &crate::models::kiro::KiroAccount) -> bool {
+        let text = format!(
+            "{} {}",
+            account.status.as_deref().unwrap_or_default(),
+            account.status_reason.as_deref().unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        text.contains("banned")
+            || text.contains("ban")
+            || text.contains("blocked")
+            || text.contains("forbidden")
+            || text.contains("suspended")
+            || text.contains("disabled")
+            || text.contains("封禁")
+            || text.contains("禁用")
+    }
+
+    fn kiro_remaining_metrics(account: &crate::models::kiro::KiroAccount) -> Vec<i32> {
+        let mut metrics = Vec::new();
+        if let (Some(total), Some(used)) = (account.credits_total, account.credits_used) {
+            if total > 0.0 {
+                metrics.push(clamp_percent(((total - used).max(0.0) / total) * 100.0));
+            }
+        }
+        if let (Some(total), Some(used)) = (account.bonus_total, account.bonus_used) {
+            if total > 0.0 {
+                metrics.push(clamp_percent(((total - used).max(0.0) / total) * 100.0));
+            }
+        }
+        metrics
+    }
+
     fn build_kiro_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::kiro_account::list_accounts();
-        let current_id = modules::kiro_account::resolve_current_account_id(&accounts);
+        let mut accounts = modules::platform_adapter::call_kiro_with_timeout::<
+            Vec<crate::models::kiro::KiroAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_kiro_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let recommended = current_id.as_deref().and_then(|id| {
             accounts
                 .iter()
                 .filter(|account| account.id != id)
-                .filter(|account| !modules::kiro_account::is_banned_account(account))
+                .filter(|account| !is_kiro_banned_account(account))
                 .filter_map(|account| {
-                    let metrics = modules::kiro_account::extract_quota_metrics(account);
+                    let metrics = kiro_remaining_metrics(account);
                     if metrics.is_empty() {
                         return None;
                     }
-                    let avg = metrics.iter().map(|(_, pct)| *pct).sum::<i32>() as f64
-                        / metrics.len() as f64;
+                    let avg = metrics.iter().sum::<i32>() as f64 / metrics.len() as f64;
                     Some((account.id.clone(), avg, account.last_used))
                 })
                 .max_by(|left, right| {
@@ -3178,30 +3769,49 @@ mod imp {
     }
 
     fn build_cursor_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::cursor_account::list_accounts();
-        let current_id = modules::cursor_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("cursor") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts: Vec<crate::models::cursor::CursorAccount> =
+            match modules::platform_adapter::call_cursor_with_timeout(
+                "accounts.list",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(20),
+            ) {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    modules::logger::log_warn(&format!(
+                        "[NativeMenu][Cursor] 读取账号列表失败: {}",
+                        error
+                    ));
+                    Vec::new()
+                }
+            };
+        let current_id: Option<String> = modules::platform_adapter::call_cursor_with_timeout(
+            "accounts.current",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap_or(None);
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let recommended = current_id.as_deref().and_then(|id| {
             accounts
                 .iter()
                 .filter(|account| account.id != id)
-                .filter(|account| !modules::cursor_account::is_banned_account(account))
+                .filter(|account| {
+                    let status = account.status.as_deref().unwrap_or("").to_ascii_lowercase();
+                    status != "banned" && status != "error"
+                })
                 .filter_map(|account| {
-                    let metrics = modules::cursor_account::extract_quota_metrics(account);
-                    if metrics.is_empty() {
-                        return None;
-                    }
-                    let avg = metrics.iter().map(|(_, pct)| *pct).sum::<i32>() as f64
-                        / metrics.len() as f64;
-                    Some((account.id.clone(), avg, account.last_used))
+                    let usage = read_cursor_tray_usage(account);
+                    let used = usage
+                        .total_used_percent
+                        .or(usage.auto_used_percent)
+                        .or(usage.api_used_percent)?;
+                    Some((account.id.clone(), used, account.last_used))
                 })
-                .max_by(|left, right| {
-                    left.1
-                        .partial_cmp(&right.1)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| left.2.cmp(&right.2))
-                })
+                .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.2.cmp(&left.2)))
                 .map(|item| item.0)
         });
         let cards = accounts
@@ -3278,9 +3888,19 @@ mod imp {
     }
 
     fn build_gemini_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::gemini_account::list_accounts();
-        let current = modules::gemini_account::resolve_current_account(&accounts);
-        let current_id = current.map(|account| account.id);
+        if !modules::platform_package::is_platform_package_installed("gemini") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = modules::platform_adapter::call_gemini::<
+            Vec<crate::models::gemini::GeminiAccount>,
+        >("accounts.list", serde_json::json!({}))
+        .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_gemini::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let recommended = current_id.as_deref().and_then(|id| {
@@ -3288,8 +3908,11 @@ mod imp {
                 .iter()
                 .filter(|account| account.id != id)
                 .filter_map(|account| {
-                    let metrics = modules::gemini_account::extract_account_model_remaining(account);
-                    let lowest = metrics.iter().map(|(_, pct)| *pct).min()?;
+                    let buckets = collect_gemini_bucket_remaining(account);
+                    let lowest = buckets
+                        .iter()
+                        .map(|bucket| bucket.remaining_percent)
+                        .min()?;
                     Some((account.id.clone(), lowest))
                 })
                 .max_by_key(|item| item.1)
@@ -3300,39 +3923,31 @@ mod imp {
             .map(|account| {
                 let buckets = collect_gemini_bucket_remaining(&account);
                 let mut rows = Vec::new();
-                if let Some(pro_bucket) =
-                    pick_lowest_gemini_bucket(&buckets, |model_id| model_id.contains("pro"))
-                {
-                    let value = translate_or(
-                        lang,
-                        "gemini.quota.left",
-                        "{{value}}% left",
-                        &[("value", &pro_bucket.remaining_percent.to_string())],
-                    );
-                    rows.push(make_progress_row(
-                        translate_or(lang, "gemini.quota.pro", "Pro", &[]),
-                        value,
-                        pro_bucket.remaining_percent,
-                        format_reset_subtext(lang, pro_bucket.reset_at),
-                        cursor_usage_tone((100 - pro_bucket.remaining_percent).clamp(0, 100)),
-                    ));
-                }
-                if let Some(flash_bucket) =
-                    pick_lowest_gemini_bucket(&buckets, |model_id| model_id.contains("flash"))
-                {
-                    let value = translate_or(
-                        lang,
-                        "gemini.quota.left",
-                        "{{value}}% left",
-                        &[("value", &flash_bucket.remaining_percent.to_string())],
-                    );
-                    rows.push(make_progress_row(
-                        translate_or(lang, "gemini.quota.flash", "Flash", &[]),
-                        value,
-                        flash_bucket.remaining_percent,
-                        format_reset_subtext(lang, flash_bucket.reset_at),
-                        cursor_usage_tone((100 - flash_bucket.remaining_percent).clamp(0, 100)),
-                    ));
+                for (bucket_id, label_key, default_label) in [
+                    ("gemini-5h", "gemini.quota.gemini5h", "Gemini 5h"),
+                    (
+                        "gemini-weekly",
+                        "gemini.quota.geminiweekly",
+                        "Gemini Weekly",
+                    ),
+                    ("3p-5h", "gemini.quota.3p5h", "Claude 5h"),
+                    ("3p-weekly", "gemini.quota.3pweekly", "Claude Weekly"),
+                ] {
+                    if let Some(bucket) = buckets.iter().find(|b| b.model_id == bucket_id) {
+                        let value = translate_or(
+                            lang,
+                            "gemini.quota.left",
+                            "{{value}}% left",
+                            &[("value", &bucket.remaining_percent.to_string())],
+                        );
+                        rows.push(make_progress_row(
+                            translate_or(lang, label_key, default_label, &[]),
+                            value,
+                            bucket.remaining_percent,
+                            format_reset_subtext(lang, bucket.reset_at),
+                            cursor_usage_tone((100 - bucket.remaining_percent).clamp(0, 100)),
+                        ));
+                    }
                 }
                 AccountCard {
                     id: account.id,
@@ -3351,8 +3966,24 @@ mod imp {
     }
 
     fn build_qoder_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::qoder_account::list_accounts();
-        let current_id = modules::qoder_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("qoder") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = modules::platform_adapter::call_qoder_with_timeout::<
+            Vec<crate::models::qoder::QoderAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_qoder_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let cards = accounts
@@ -3478,8 +4109,26 @@ mod imp {
     }
 
     fn build_trae_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::trae_account::list_accounts();
-        let current_id = modules::trae_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("trae") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = match modules::platform_adapter::call_trae_with_timeout::<
+            Vec<crate::models::trae::TraeAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        ) {
+            Ok(accounts) => accounts,
+            Err(err) => return (Vec::new(), None, Some(err)),
+        };
+        let current_id = modules::platform_adapter::call_trae_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let cards = accounts
@@ -3561,8 +4210,26 @@ mod imp {
     }
 
     fn build_codebuddy_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::codebuddy_account::list_accounts();
-        let current_id = modules::codebuddy_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("codebuddy") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = match modules::platform_adapter::call_codebuddy_with_timeout::<
+            Vec<crate::models::codebuddy::CodebuddyAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        ) {
+            Ok(accounts) => accounts,
+            Err(err) => return (Vec::new(), None, Some(err)),
+        };
+        let current_id = modules::platform_adapter::call_codebuddy_with_timeout::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let cards = accounts
@@ -3623,8 +4290,27 @@ mod imp {
     }
 
     fn build_codebuddy_cn_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::codebuddy_cn_account::list_accounts();
-        let current_id = modules::codebuddy_cn_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_installed("codebuddy_cn") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts = match modules::platform_adapter::call_codebuddy_cn_with_timeout::<
+            Vec<crate::models::codebuddy::CodebuddyAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        ) {
+            Ok(accounts) => accounts,
+            Err(err) => return (Vec::new(), None, Some(err)),
+        };
+        let current_id =
+            modules::platform_adapter::call_codebuddy_cn_with_timeout::<Option<String>>(
+                "accounts.current",
+                serde_json::json!({}),
+                Duration::from_secs(20),
+            )
+            .ok()
+            .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let cards = accounts
@@ -3685,8 +4371,22 @@ mod imp {
     }
 
     fn build_workbuddy_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::workbuddy_account::list_accounts();
-        let current_id = modules::workbuddy_account::resolve_current_account_id(&accounts);
+        if !modules::platform_package::is_platform_package_runtime_ready("workbuddy") {
+            return (Vec::new(), None, None);
+        }
+        let mut accounts: Vec<crate::models::workbuddy::WorkbuddyAccount> =
+            modules::platform_adapter::call_workbuddy_with_timeout(
+                "accounts.list",
+                serde_json::json!({}),
+                Duration::from_secs(20),
+            )
+            .unwrap_or_default();
+        let current_id: Option<String> = modules::platform_adapter::call_workbuddy_with_timeout(
+            "accounts.current",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or(None);
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let cards = accounts
@@ -3747,8 +4447,18 @@ mod imp {
     }
 
     fn build_zed_cards(lang: &str) -> (Vec<AccountCard>, Option<String>, Option<String>) {
-        let mut accounts = modules::zed_account::list_accounts();
-        let current_id = modules::zed_account::resolve_current_account_id();
+        let mut accounts =
+            modules::platform_adapter::call_zed::<Vec<crate::models::zed::ZedAccount>>(
+                "accounts.list",
+                serde_json::json!({}),
+            )
+            .unwrap_or_default();
+        let current_id = modules::platform_adapter::call_zed::<Option<String>>(
+            "accounts.current",
+            serde_json::json!({}),
+        )
+        .ok()
+        .flatten();
         accounts
             .sort_by_key(|account| std::cmp::Reverse(account.last_used.max(account.created_at)));
         let recommended = current_id.as_deref().and_then(|id| {
@@ -3756,7 +4466,7 @@ mod imp {
                 .iter()
                 .filter(|account| account.id != id)
                 .filter_map(|account| {
-                    let metrics = modules::zed_account::extract_quota_metrics(account);
+                    let metrics = crate::models::zed::extract_zed_quota_metrics(account);
                     if metrics.is_empty() {
                         return None;
                     }
@@ -3839,12 +4549,59 @@ mod imp {
         (cards, current_id, recommended)
     }
 
+    async fn refresh_codex_api_key_usage_for_menu(
+        app: AppHandle,
+        account_id: String,
+    ) -> Result<(), String> {
+        if !modules::platform_package::is_platform_package_runtime_ready("codex") {
+            return Err("Codex 平台包未安装或未就绪".to_string());
+        }
+
+        modules::platform_adapter::call_codex_value(
+            "accounts.refreshApiKeyUsage",
+            serde_json::json!({ "accountId": account_id }),
+        )?;
+        let _ = crate::modules::tray::update_tray_menu(&app);
+        Ok(())
+    }
+
+    async fn refresh_all_codex_usage_for_menu(app: AppHandle) -> Result<i32, String> {
+        if !modules::platform_package::is_platform_package_runtime_ready("codex") {
+            return Ok(0);
+        }
+
+        let accounts = modules::platform_adapter::call_codex_with_timeout::<
+            Vec<crate::models::codex::CodexAccount>,
+        >(
+            "accounts.list",
+            serde_json::json!({}),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_default();
+        let mut refreshed = 0;
+        let mut last_error: Option<String> = None;
+        for account in accounts {
+            match refresh_codex_api_key_usage_for_menu(app.clone(), account.id.clone()).await {
+                Ok(_) => refreshed += 1,
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if refreshed > 0 {
+            Ok(refreshed)
+        } else {
+            Err(last_error.unwrap_or_else(|| "没有可刷新的 Codex 账号".to_string()))
+        }
+    }
+
     fn spawn_refresh(platform: PlatformId, account_id: Option<String>) {
         let Some(app) = crate::get_app_handle().cloned() else {
             return;
         };
 
         tauri::async_runtime::spawn(async move {
+            if !platform.runtime_ready() {
+                return;
+            }
             let refresh_result = match (platform, account_id) {
                 (PlatformId::Antigravity, Some(account_id)) => {
                     commands::account::fetch_account_quota(account_id)
@@ -3858,14 +4615,26 @@ mod imp {
                         .map(|_| 0)
                 }
                 (PlatformId::Codex, Some(account_id)) => {
-                    commands::codex::refresh_codex_quota(app.clone(), account_id)
+                    if !modules::platform_package::is_platform_package_runtime_ready("codex") {
+                        return;
+                    }
+                    refresh_codex_api_key_usage_for_menu(app.clone(), account_id)
                         .await
                         .map(|_| 0)
                 }
                 (PlatformId::Codex, None) => {
-                    commands::codex::refresh_current_codex_quota(app.clone())
+                    if !modules::platform_package::is_platform_package_runtime_ready("codex") {
+                        return;
+                    }
+                    refresh_all_codex_usage_for_menu(app.clone()).await
+                }
+                (PlatformId::Claude, Some(account_id)) => {
+                    commands::claude::refresh_claude_quota(app.clone(), account_id)
                         .await
                         .map(|_| 0)
+                }
+                (PlatformId::Claude, None) => {
+                    commands::claude::refresh_all_claude_quotas(app.clone()).await
                 }
                 (PlatformId::GitHubCopilot, Some(account_id)) => {
                     commands::github_copilot::refresh_github_copilot_token(app.clone(), account_id)
@@ -3978,13 +4747,24 @@ mod imp {
         };
 
         tauri::async_runtime::spawn(async move {
+            if !platform.runtime_ready() {
+                return;
+            }
             let _ = match platform {
                 PlatformId::Antigravity => commands::account::switch_account(app, account_id, None)
                     .await
                     .map(|_| ()),
-                PlatformId::Codex => commands::codex::switch_codex_account(app, account_id)
-                    .await
-                    .map(|_| ()),
+                PlatformId::Codex => {
+                    if !modules::platform_package::is_platform_package_runtime_ready("codex") {
+                        return;
+                    }
+                    commands::codex::switch_codex_account(app, account_id, None)
+                        .await
+                        .map(|_| ())
+                }
+                PlatformId::Claude => {
+                    commands::claude::switch_claude_account(app, account_id).map(|_| ())
+                }
                 PlatformId::GitHubCopilot => {
                     commands::github_copilot::inject_github_copilot_to_vscode(app, account_id)
                         .await
@@ -4001,9 +4781,9 @@ mod imp {
                 PlatformId::Cursor => commands::cursor::inject_cursor_account(app, account_id)
                     .await
                     .map(|_| ()),
-                PlatformId::Gemini => {
-                    commands::gemini::inject_gemini_account(app, account_id).map(|_| ())
-                }
+                PlatformId::Gemini => commands::gemini::inject_gemini_account(app, account_id)
+                    .await
+                    .map(|_| ()),
                 PlatformId::Codebuddy => {
                     commands::codebuddy::inject_codebuddy_to_vscode(app, account_id)
                         .await

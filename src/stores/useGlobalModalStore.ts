@@ -10,6 +10,7 @@ export interface GlobalModalAction {
   onClick?: () => void | Promise<void>;
   autoClose?: boolean;
   disabled?: boolean;
+  suppressError?: boolean;
 }
 
 export interface GlobalModalOptions {
@@ -17,7 +18,6 @@ export interface GlobalModalOptions {
   description?: string;
   content?: ReactNode;
   width?: 'sm' | 'md' | 'lg';
-  closeOnOverlay?: boolean;
   showCloseButton?: boolean;
   actions?: GlobalModalAction[];
 }

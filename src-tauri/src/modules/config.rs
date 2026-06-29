@@ -21,6 +21,26 @@ const SERVER_STATUS_FILE: &str = "server.json";
 /// 用户配置文件名
 const USER_CONFIG_FILE: &str = "config.json";
 
+const LOCAL_PROXY_BYPASS_HOSTS: [&str; 5] =
+    ["127.0.0.1", "127.0.0.0/8", "localhost", "::1", "::1/128"];
+
+pub fn merge_local_no_proxy(raw: &str) -> String {
+    let mut values: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    for host in LOCAL_PROXY_BYPASS_HOSTS {
+        if !values.iter().any(|item| item.eq_ignore_ascii_case(host)) {
+            values.push(host.to_string());
+        }
+    }
+
+    values.join(",")
+}
+
 /// 服务状态（写入共享文件供其他客户端读取）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -79,6 +99,12 @@ pub struct UserConfig {
     /// Codex 自动刷新间隔（分钟），-1 表示禁用
     #[serde(default = "default_codex_auto_refresh")]
     pub codex_auto_refresh_minutes: i32,
+    /// Codex 切号时是否同步覆盖 WSL 配置 (Windows Only)
+    #[serde(default = "default_codex_sync_wsl")]
+    pub codex_sync_wsl: bool,
+    /// Codex WSL 配置目录 (Windows Only)
+    #[serde(default = "default_codex_wsl_config_dir")]
+    pub codex_wsl_config_dir: String,
     /// Zed 自动刷新间隔（分钟），-1 表示禁用
     #[serde(default = "default_zed_auto_refresh")]
     pub zed_auto_refresh_minutes: i32,
@@ -97,6 +123,9 @@ pub struct UserConfig {
     /// Gemini 自动刷新间隔（分钟），-1 表示禁用
     #[serde(default = "default_gemini_auto_refresh")]
     pub gemini_auto_refresh_minutes: i32,
+    /// Claude 自动刷新间隔（分钟），-1 表示禁用
+    #[serde(default = "default_claude_auto_refresh")]
+    pub claude_auto_refresh_minutes: i32,
     /// Gemini 切号时是否同步覆盖 WSL 配置 (Windows Only)
     #[serde(default = "default_gemini_sync_wsl")]
     pub gemini_sync_wsl: bool,
@@ -127,9 +156,18 @@ pub struct UserConfig {
     /// 菜单栏图标样式（macOS）
     #[serde(default = "default_tray_icon_style")]
     pub tray_icon_style: TrayIconStyle,
+    /// 冷启动启动页面：页面 ID 或 last_closed
+    #[serde(default = "default_startup_page")]
+    pub startup_page: String,
+    /// 上次主窗口关闭/隐藏时所在页面
+    #[serde(default = "default_last_closed_page")]
+    pub last_closed_page: String,
     /// 是否在启动后自动显示悬浮卡片
     #[serde(default = "default_floating_card_show_on_startup")]
     pub floating_card_show_on_startup: bool,
+    /// 是否在启动后自动最小化主窗口
+    #[serde(default = "default_startup_minimized")]
+    pub startup_minimized: bool,
     /// 悬浮卡片是否默认置顶
     #[serde(default = "default_floating_card_always_on_top")]
     pub floating_card_always_on_top: bool,
@@ -169,6 +207,36 @@ pub struct UserConfig {
     /// 最近一次自动备份时间（ISO 8601）
     #[serde(default)]
     pub auto_backup_last_backup_at: Option<String>,
+    /// WebDAV 备份同步是否启用
+    #[serde(default = "default_webdav_sync_enabled")]
+    pub webdav_sync_enabled: bool,
+    /// WebDAV 服务地址
+    #[serde(default = "default_webdav_sync_url")]
+    pub webdav_sync_url: String,
+    /// WebDAV 用户名
+    #[serde(default = "default_webdav_sync_username")]
+    pub webdav_sync_username: String,
+    /// WebDAV 密码或应用密码
+    #[serde(default = "default_webdav_sync_password")]
+    pub webdav_sync_password: String,
+    /// WebDAV 远端备份目录
+    #[serde(default = "default_webdav_sync_remote_dir")]
+    pub webdav_sync_remote_dir: String,
+    /// WebDAV 远端备份保留天数
+    #[serde(default = "default_webdav_sync_retention_days")]
+    pub webdav_sync_retention_days: i32,
+    /// 最近一次 WebDAV 上传时间（ISO 8601）
+    #[serde(default)]
+    pub webdav_sync_last_upload_at: Option<String>,
+    /// 最近一次 WebDAV 上传文件名
+    #[serde(default)]
+    pub webdav_sync_last_upload_file_name: Option<String>,
+    /// 最近一次 WebDAV 下载时间（ISO 8601）
+    #[serde(default)]
+    pub webdav_sync_last_download_at: Option<String>,
+    /// 最近一次 WebDAV 下载文件名
+    #[serde(default)]
+    pub webdav_sync_last_download_file_name: Option<String>,
     /// 悬浮卡片保存的横向位置（物理像素）
     #[serde(default)]
     pub floating_card_position_x: Option<i32>,
@@ -184,6 +252,11 @@ pub struct UserConfig {
     /// Codex 启动路径（为空则使用默认路径）
     #[serde(default = "default_codex_app_path")]
     pub codex_app_path: String,
+    /// Claude 桌面应用启动路径（为空则使用默认路径）
+    #[serde(default = "default_claude_app_path")]
+    pub claude_app_path: String,
+    #[serde(default = "default_claude_app_scan_roots")]
+    pub claude_app_scan_roots: String,
     /// 切换 Codex 后需联动重启的指定应用路径
     #[serde(default = "default_codex_specified_app_path")]
     pub codex_specified_app_path: String,
@@ -244,6 +317,9 @@ pub struct UserConfig {
     /// 是否在 Codex 总览中显示 API 服务入口
     #[serde(default = "default_codex_local_access_entry_visible")]
     pub codex_local_access_entry_visible: bool,
+    /// 是否显示顶部推广位
+    #[serde(default = "default_top_right_ad_visible")]
+    pub top_right_ad_visible: bool,
     /// Antigravity 切号是否启用“本地落盘 + 扩展无感”且不重启
     #[serde(default = "default_antigravity_dual_switch_no_restart_enabled")]
     pub antigravity_dual_switch_no_restart_enabled: bool,
@@ -340,6 +416,12 @@ pub struct UserConfig {
     /// Gemini 配额预警阈值（百分比）
     #[serde(default = "default_gemini_quota_alert_threshold")]
     pub gemini_quota_alert_threshold: i32,
+    /// 是否启用 Claude 配额预警通知
+    #[serde(default = "default_claude_quota_alert_enabled")]
+    pub claude_quota_alert_enabled: bool,
+    /// Claude 配额预警阈值（百分比）
+    #[serde(default = "default_claude_quota_alert_threshold")]
+    pub claude_quota_alert_threshold: i32,
     /// 是否启用 CodeBuddy 配额预警通知
     #[serde(default = "default_codebuddy_quota_alert_enabled")]
     pub codebuddy_quota_alert_enabled: bool,
@@ -480,6 +562,12 @@ fn default_auto_refresh() -> i32 {
 fn default_codex_auto_refresh() -> i32 {
     10
 } // 默认 10 分钟
+fn default_codex_sync_wsl() -> bool {
+    false
+}
+fn default_codex_wsl_config_dir() -> String {
+    String::new()
+}
 fn default_zed_auto_refresh() -> i32 {
     10
 }
@@ -496,6 +584,9 @@ fn default_cursor_auto_refresh() -> i32 {
     10
 } // 默认 10 分钟
 fn default_gemini_auto_refresh() -> i32 {
+    10
+}
+fn default_claude_auto_refresh() -> i32 {
     10
 }
 fn default_gemini_sync_wsl() -> bool {
@@ -528,7 +619,16 @@ fn default_hide_dock_icon() -> bool {
 fn default_tray_icon_style() -> TrayIconStyle {
     TrayIconStyle::Template
 }
+fn default_startup_page() -> String {
+    "dashboard".to_string()
+}
+fn default_last_closed_page() -> String {
+    "dashboard".to_string()
+}
 fn default_floating_card_show_on_startup() -> bool {
+    false
+}
+fn default_startup_minimized() -> bool {
     false
 }
 fn default_floating_card_always_on_top() -> bool {
@@ -583,6 +683,27 @@ pub fn normalize_auto_backup_selection(
         (include_accounts, include_config)
     }
 }
+pub fn default_webdav_sync_enabled() -> bool {
+    true
+}
+pub fn default_webdav_sync_url() -> String {
+    "https://dav.jianguoyun.com/dav/".to_string()
+}
+pub fn default_webdav_sync_username() -> String {
+    String::new()
+}
+pub fn default_webdav_sync_password() -> String {
+    String::new()
+}
+pub fn default_webdav_sync_remote_dir() -> String {
+    "cockpit-tools".to_string()
+}
+pub fn default_webdav_sync_retention_days() -> i32 {
+    15
+}
+pub fn sanitize_webdav_sync_retention_days(raw: i32) -> i32 {
+    raw.clamp(1, 365)
+}
 fn default_opencode_app_path() -> String {
     String::new()
 }
@@ -590,6 +711,12 @@ fn default_antigravity_app_path() -> String {
     String::new()
 }
 fn default_codex_app_path() -> String {
+    String::new()
+}
+fn default_claude_app_path() -> String {
+    String::new()
+}
+fn default_claude_app_scan_roots() -> String {
     String::new()
 }
 fn default_codex_specified_app_path() -> String {
@@ -650,6 +777,9 @@ fn default_codex_restart_specified_app_on_switch() -> bool {
     false
 }
 fn default_codex_local_access_entry_visible() -> bool {
+    true
+}
+fn default_top_right_ad_visible() -> bool {
     true
 }
 fn default_antigravity_dual_switch_no_restart_enabled() -> bool {
@@ -748,6 +878,12 @@ fn default_gemini_quota_alert_enabled() -> bool {
 fn default_gemini_quota_alert_threshold() -> i32 {
     20
 }
+fn default_claude_quota_alert_enabled() -> bool {
+    false
+}
+fn default_claude_quota_alert_threshold() -> i32 {
+    20
+}
 fn default_codebuddy_quota_alert_enabled() -> bool {
     false
 }
@@ -796,12 +932,15 @@ impl Default for UserConfig {
             ui_scale: default_ui_scale(),
             auto_refresh_minutes: default_auto_refresh(),
             codex_auto_refresh_minutes: default_codex_auto_refresh(),
+            codex_sync_wsl: default_codex_sync_wsl(),
+            codex_wsl_config_dir: default_codex_wsl_config_dir(),
             zed_auto_refresh_minutes: default_zed_auto_refresh(),
             ghcp_auto_refresh_minutes: default_ghcp_auto_refresh(),
             windsurf_auto_refresh_minutes: default_windsurf_auto_refresh(),
             kiro_auto_refresh_minutes: default_kiro_auto_refresh(),
             cursor_auto_refresh_minutes: default_cursor_auto_refresh(),
             gemini_auto_refresh_minutes: default_gemini_auto_refresh(),
+            claude_auto_refresh_minutes: default_claude_auto_refresh(),
             gemini_sync_wsl: default_gemini_sync_wsl(),
             codebuddy_auto_refresh_minutes: default_codebuddy_auto_refresh(),
             codebuddy_cn_auto_refresh_minutes: default_codebuddy_cn_auto_refresh(),
@@ -812,7 +951,10 @@ impl Default for UserConfig {
             minimize_behavior: default_minimize_behavior(),
             hide_dock_icon: default_hide_dock_icon(),
             tray_icon_style: default_tray_icon_style(),
+            startup_page: default_startup_page(),
+            last_closed_page: default_last_closed_page(),
             floating_card_show_on_startup: default_floating_card_show_on_startup(),
+            startup_minimized: default_startup_minimized(),
             floating_card_always_on_top: default_floating_card_always_on_top(),
             app_auto_launch_enabled: default_app_auto_launch_enabled(),
             antigravity_startup_wakeup_enabled: default_antigravity_startup_wakeup_enabled(),
@@ -827,11 +969,23 @@ impl Default for UserConfig {
             auto_backup_retention_days: default_auto_backup_retention_days(),
             auto_backup_retention_days_migrated: default_auto_backup_retention_days_migrated(),
             auto_backup_last_backup_at: None,
+            webdav_sync_enabled: default_webdav_sync_enabled(),
+            webdav_sync_url: default_webdav_sync_url(),
+            webdav_sync_username: default_webdav_sync_username(),
+            webdav_sync_password: default_webdav_sync_password(),
+            webdav_sync_remote_dir: default_webdav_sync_remote_dir(),
+            webdav_sync_retention_days: default_webdav_sync_retention_days(),
+            webdav_sync_last_upload_at: None,
+            webdav_sync_last_upload_file_name: None,
+            webdav_sync_last_download_at: None,
+            webdav_sync_last_download_file_name: None,
             floating_card_position_x: None,
             floating_card_position_y: None,
             opencode_app_path: default_opencode_app_path(),
             antigravity_app_path: default_antigravity_app_path(),
             codex_app_path: default_codex_app_path(),
+            claude_app_path: default_claude_app_path(),
+            claude_app_scan_roots: default_claude_app_scan_roots(),
             codex_specified_app_path: default_codex_specified_app_path(),
             zed_app_path: default_zed_app_path(),
             vscode_app_path: default_vscode_app_path(),
@@ -853,6 +1007,7 @@ impl Default for UserConfig {
             codex_launch_on_switch: default_codex_launch_on_switch(),
             codex_restart_specified_app_on_switch: default_codex_restart_specified_app_on_switch(),
             codex_local_access_entry_visible: default_codex_local_access_entry_visible(),
+            top_right_ad_visible: default_top_right_ad_visible(),
             antigravity_dual_switch_no_restart_enabled:
                 default_antigravity_dual_switch_no_restart_enabled(),
             auto_switch_enabled: default_auto_switch_enabled(),
@@ -887,6 +1042,8 @@ impl Default for UserConfig {
             cursor_quota_alert_threshold: default_cursor_quota_alert_threshold(),
             gemini_quota_alert_enabled: default_gemini_quota_alert_enabled(),
             gemini_quota_alert_threshold: default_gemini_quota_alert_threshold(),
+            claude_quota_alert_enabled: default_claude_quota_alert_enabled(),
+            claude_quota_alert_threshold: default_claude_quota_alert_threshold(),
             codebuddy_quota_alert_enabled: default_codebuddy_quota_alert_enabled(),
             codebuddy_quota_alert_threshold: default_codebuddy_quota_alert_threshold(),
             codebuddy_cn_quota_alert_enabled: default_codebuddy_cn_quota_alert_enabled(),
@@ -961,8 +1118,7 @@ fn managed_proxy_env_pairs(config: &UserConfig) -> Vec<(&'static str, String)> {
         pairs.push((key, proxy_url.to_string()));
     }
 
-    let no_proxy =
-        crate::modules::codex_protocol::merge_local_no_proxy(config.global_proxy_no_proxy.trim());
+    let no_proxy = merge_local_no_proxy(config.global_proxy_no_proxy.trim());
     if !no_proxy.is_empty() {
         for key in MANAGED_PROXY_NO_PROXY_KEYS {
             pairs.push((key, no_proxy.clone()));
@@ -1028,13 +1184,13 @@ pub fn sync_global_proxy_env(config: &UserConfig) {
 
 /// 获取数据目录路径
 pub fn get_data_dir() -> Result<PathBuf, String> {
-    crate::modules::account::get_data_dir()
+    crate::modules::app_data::get_data_dir()
 }
 
 /// 获取共享目录路径（供其他模块使用）
 /// 与 get_data_dir 相同，但不返回 Result
 pub fn get_shared_dir() -> PathBuf {
-    crate::modules::account::resolve_data_dir()
+    crate::modules::app_data::resolve_data_dir()
         .unwrap_or_else(|_| PathBuf::from(".antigravity_cockpit"))
 }
 
@@ -1128,6 +1284,33 @@ pub fn load_user_config() -> Result<UserConfig, String> {
             );
         }
 
+        if !obj.contains_key("claude_auto_refresh_minutes") {
+            let inherited_refresh = obj
+                .get("gemini_auto_refresh_minutes")
+                .or_else(|| obj.get("codex_auto_refresh_minutes"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+                .unwrap_or_else(default_claude_auto_refresh);
+            obj.insert(
+                "claude_auto_refresh_minutes".to_string(),
+                json!(inherited_refresh),
+            );
+        }
+
+        if !obj.contains_key("codex_sync_wsl") {
+            obj.insert(
+                "codex_sync_wsl".to_string(),
+                json!(default_codex_sync_wsl()),
+            );
+        }
+
+        if !obj.contains_key("codex_wsl_config_dir") {
+            obj.insert(
+                "codex_wsl_config_dir".to_string(),
+                json!(default_codex_wsl_config_dir()),
+            );
+        }
+
         if !obj.contains_key("gemini_sync_wsl") {
             obj.insert(
                 "gemini_sync_wsl".to_string(),
@@ -1208,10 +1391,28 @@ pub fn load_user_config() -> Result<UserConfig, String> {
             );
         }
 
+        if !obj.contains_key("startup_page") {
+            obj.insert("startup_page".to_string(), json!(default_startup_page()));
+        }
+
+        if !obj.contains_key("last_closed_page") {
+            obj.insert(
+                "last_closed_page".to_string(),
+                json!(default_last_closed_page()),
+            );
+        }
+
         if !obj.contains_key("floating_card_show_on_startup") {
             obj.insert(
                 "floating_card_show_on_startup".to_string(),
                 json!(default_floating_card_show_on_startup()),
+            );
+        }
+
+        if !obj.contains_key("startup_minimized") {
+            obj.insert(
+                "startup_minimized".to_string(),
+                json!(default_startup_minimized()),
             );
         }
 
@@ -1264,6 +1465,13 @@ pub fn load_user_config() -> Result<UserConfig, String> {
             );
         }
 
+        if !obj.contains_key("top_right_ad_visible") {
+            obj.insert(
+                "top_right_ad_visible".to_string(),
+                json!(default_top_right_ad_visible()),
+            );
+        }
+
         if !obj.contains_key("floating_card_confirm_on_close") {
             obj.insert(
                 "floating_card_confirm_on_close".to_string(),
@@ -1304,6 +1512,66 @@ pub fn load_user_config() -> Result<UserConfig, String> {
         if !obj.contains_key("auto_backup_last_backup_at") {
             obj.insert(
                 "auto_backup_last_backup_at".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+        if !obj.contains_key("webdav_sync_enabled") {
+            obj.insert(
+                "webdav_sync_enabled".to_string(),
+                json!(default_webdav_sync_enabled()),
+            );
+        }
+        if !obj.contains_key("webdav_sync_url") {
+            obj.insert(
+                "webdav_sync_url".to_string(),
+                json!(default_webdav_sync_url()),
+            );
+        }
+        if !obj.contains_key("webdav_sync_username") {
+            obj.insert(
+                "webdav_sync_username".to_string(),
+                json!(default_webdav_sync_username()),
+            );
+        }
+        if !obj.contains_key("webdav_sync_password") {
+            obj.insert(
+                "webdav_sync_password".to_string(),
+                json!(default_webdav_sync_password()),
+            );
+        }
+        if !obj.contains_key("webdav_sync_remote_dir") {
+            obj.insert(
+                "webdav_sync_remote_dir".to_string(),
+                json!(default_webdav_sync_remote_dir()),
+            );
+        }
+        if !obj.contains_key("webdav_sync_retention_days") {
+            obj.insert(
+                "webdav_sync_retention_days".to_string(),
+                json!(default_webdav_sync_retention_days()),
+            );
+        }
+        if !obj.contains_key("webdav_sync_last_upload_at") {
+            obj.insert(
+                "webdav_sync_last_upload_at".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+        if !obj.contains_key("webdav_sync_last_upload_file_name") {
+            obj.insert(
+                "webdav_sync_last_upload_file_name".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+        if !obj.contains_key("webdav_sync_last_download_at") {
+            obj.insert(
+                "webdav_sync_last_download_at".to_string(),
+                serde_json::Value::Null,
+            );
+        }
+        if !obj.contains_key("webdav_sync_last_download_file_name") {
+            obj.insert(
+                "webdav_sync_last_download_file_name".to_string(),
                 serde_json::Value::Null,
             );
         }
@@ -1528,6 +1796,18 @@ pub fn load_user_config() -> Result<UserConfig, String> {
                 json!(legacy_threshold),
             );
         }
+        if !obj.contains_key("claude_quota_alert_enabled") {
+            obj.insert(
+                "claude_quota_alert_enabled".to_string(),
+                json!(legacy_enabled),
+            );
+        }
+        if !obj.contains_key("claude_quota_alert_threshold") {
+            obj.insert(
+                "claude_quota_alert_threshold".to_string(),
+                json!(legacy_threshold),
+            );
+        }
         if !obj.contains_key("codebuddy_quota_alert_enabled") {
             obj.insert(
                 "codebuddy_quota_alert_enabled".to_string(),
@@ -1630,6 +1910,8 @@ pub fn load_user_config() -> Result<UserConfig, String> {
     }
     config.auto_backup_retention_days =
         sanitize_auto_backup_retention_days(config.auto_backup_retention_days);
+    config.webdav_sync_retention_days =
+        sanitize_webdav_sync_retention_days(config.webdav_sync_retention_days);
     config.auto_backup_last_backup_at = config.auto_backup_last_backup_at.and_then(|value| {
         let trimmed = value.trim().to_string();
         if trimmed.is_empty() {
@@ -1753,5 +2035,43 @@ mod tests {
         let cfg: UserConfig =
             serde_json::from_value(serde_json::json!({})).expect("反序列化默认配置应成功");
         assert!(!cfg.openclaw_auth_overwrite_on_switch);
+    }
+
+    #[test]
+    fn startup_page_defaults_to_dashboard() {
+        let cfg = UserConfig::default();
+        assert_eq!(cfg.startup_page, "dashboard");
+        assert_eq!(cfg.last_closed_page, "dashboard");
+    }
+
+    #[test]
+    fn startup_page_missing_fields_fall_back_to_dashboard() {
+        let cfg: UserConfig =
+            serde_json::from_value(serde_json::json!({})).expect("反序列化默认配置应成功");
+        assert_eq!(cfg.startup_page, "dashboard");
+        assert_eq!(cfg.last_closed_page, "dashboard");
+    }
+
+    #[test]
+    fn webdav_sync_defaults_are_safe_for_jianguoyun_backup_sync() {
+        let cfg = UserConfig::default();
+        assert!(cfg.webdav_sync_enabled);
+        assert_eq!(cfg.webdav_sync_url, "https://dav.jianguoyun.com/dav/");
+        assert_eq!(cfg.webdav_sync_username, "");
+        assert_eq!(cfg.webdav_sync_password, "");
+        assert_eq!(cfg.webdav_sync_remote_dir, "cockpit-tools");
+        assert_eq!(cfg.webdav_sync_last_upload_at, None);
+        assert_eq!(cfg.webdav_sync_last_upload_file_name, None);
+        assert_eq!(cfg.webdav_sync_last_download_at, None);
+        assert_eq!(cfg.webdav_sync_last_download_file_name, None);
+    }
+
+    #[test]
+    fn webdav_sync_missing_fields_fall_back_to_defaults() {
+        let cfg: UserConfig =
+            serde_json::from_value(serde_json::json!({})).expect("反序列化默认配置应成功");
+        assert!(cfg.webdav_sync_enabled);
+        assert_eq!(cfg.webdav_sync_url, "https://dav.jianguoyun.com/dav/");
+        assert_eq!(cfg.webdav_sync_remote_dir, "cockpit-tools");
     }
 }

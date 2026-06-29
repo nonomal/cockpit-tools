@@ -9,7 +9,6 @@ import {
   Rocket,
   Search,
   Settings,
-  ShieldAlert,
   Sparkles,
 } from 'lucide-react';
 import type { Page } from '../types/navigation';
@@ -215,36 +214,6 @@ export function ManualPage({ onNavigate, onOpenPlatformLayout }: ManualPageProps
         ],
       },
       {
-        id: 'fingerprints',
-        icon: <ShieldAlert size={18} />,
-        title: t('manual.fingerprints.title', '设备指纹'),
-        summary: t(
-          'manual.fingerprints.summary',
-          '管理指纹模板与账号绑定关系，支持生成、捕获、导入和绑定账号维护。',
-        ),
-        outcomes: [
-          t('manual.fingerprints.outcomes.0', '生成/捕获新指纹并维护元数据。'),
-          t('manual.fingerprints.outcomes.1', '查看某指纹已绑定账号并增删绑定关系。'),
-        ],
-        steps: [
-          t('manual.fingerprints.steps.0', '先创建或导入指纹。'),
-          t('manual.fingerprints.steps.1', '进入详情确认指纹信息是否正确。'),
-          t('manual.fingerprints.steps.2', '在绑定管理中将账号关联到目标指纹。'),
-        ],
-        cautions: [
-          t('manual.fingerprints.cautions.0', '删除指纹前先看绑定账号数量，避免误操作影响生产账号。'),
-        ],
-        keywords: [
-          t('manual.fingerprints.keywords.0', '指纹'),
-          t('manual.fingerprints.keywords.1', '绑定'),
-          t('manual.fingerprints.keywords.2', '导入'),
-          t('manual.fingerprints.keywords.3', 'capture'),
-        ],
-        actions: [
-          { id: 'go-fingerprints', kind: 'navigate', page: 'fingerprints', label: t('manual.actions.goFingerprints', '前往设备指纹'), primary: true },
-        ],
-      },
-      {
         id: 'wakeup',
         icon: <Rocket size={18} />,
         title: t('manual.wakeup.title', '唤醒任务与验证'),
@@ -324,14 +293,14 @@ export function ManualPage({ onNavigate, onOpenPlatformLayout }: ManualPageProps
           t('manual.dataPrivacy.outcomes.0', '批量导入账号，快速迁移环境。'),
           t('manual.dataPrivacy.outcomes.1', '导出 JSON 做备份或跨设备迁移。'),
           t('manual.dataPrivacy.outcomes.2', '通过错误提示和文件修复指引定位问题。'),
-          t('manual.dataPrivacy.outcomes.3', '可通过数据目录下 logs 的 app.log* 快速定位运行异常。'),
+          t('manual.dataPrivacy.outcomes.3', '可通过数据目录下 logs 的 app-日期.log 与 platform-平台-日期.log 快速定位运行异常。'),
         ],
         steps: [
           t('manual.dataPrivacy.steps.0', '批量操作前先导出一次当前数据作为快照。'),
           t('manual.dataPrivacy.steps.1', '在列表页通过“显示/隐藏邮箱”切换隐私视图。'),
           t('manual.dataPrivacy.steps.2', '遇到文件损坏提示时，按弹窗指引打开目录修复。'),
           t('manual.dataPrivacy.steps.3', '排障时先进入“设置 -> 数据目录 -> 打开”，进入 logs 文件夹。'),
-          t('manual.dataPrivacy.steps.4', '优先查看最新的 app.log 或 app.log.*（按日期滚动的日志文件）。'),
+          t('manual.dataPrivacy.steps.4', '优先查看最新的 app-日期.log；平台问题优先选择对应 platform-平台-日期.log。'),
           t('manual.dataPrivacy.steps.5', '提交反馈时建议附上：发生时间、平台、复现步骤、关键报错日志（前后 20 行）。'),
         ],
         cautions: [
@@ -347,7 +316,7 @@ export function ManualPage({ onNavigate, onOpenPlatformLayout }: ManualPageProps
           t('manual.dataPrivacy.keywords.4', '故障'),
           t('manual.dataPrivacy.keywords.5', '日志'),
           t('manual.dataPrivacy.keywords.6', 'logs'),
-          t('manual.dataPrivacy.keywords.7', 'app.log'),
+          t('manual.dataPrivacy.keywords.7', 'app-日期.log'),
         ],
         actions: [
           { id: 'go-overview', kind: 'navigate', page: 'overview', label: t('manual.actions.goAntigravity', '前往 Antigravity IDE'), primary: true },
@@ -431,7 +400,7 @@ export function ManualPage({ onNavigate, onOpenPlatformLayout }: ManualPageProps
             type="text"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={t('manual.searchPlaceholder', '搜索功能、场景或关键词（如：多开、注入、唤醒、指纹）')}
+            placeholder={t('manual.searchPlaceholder', '搜索功能、场景或关键词（如：多开、注入、唤醒）')}
             aria-label={t('manual.searchAria', '搜索手册')}
           />
         </div>

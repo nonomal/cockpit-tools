@@ -2,6 +2,7 @@ import { ReactNode, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Bot, Clock3, FolderOpen, Github, Layers, Server } from 'lucide-react';
 import { CodexIcon } from '../icons/CodexIcon';
+import { ClaudeIcon } from '../icons/ClaudeIcon';
 import { WindsurfIcon } from '../icons/WindsurfIcon';
 import { KiroIcon } from '../icons/KiroIcon';
 import { CursorIcon } from '../icons/CursorIcon';
@@ -20,10 +21,13 @@ import {
 } from '../../stores/usePlatformLayoutStore';
 import { getPlatformLabel } from '../../utils/platformMeta';
 import { PlatformGroupSwitcher } from './PlatformGroupSwitcher';
+import { useRemoteConfigStore } from '../../stores/useRemoteConfigStore';
 
 export type PlatformOverviewTab = 'overview' | 'wakeup' | 'instances' | 'sessions' | 'providers';
 export type PlatformOverviewHeaderId =
   | 'codex'
+  | 'claude'
+  | 'claude_manager'
   | 'zed'
   | 'github-copilot'
   | 'windsurf'
@@ -41,6 +45,9 @@ interface PlatformOverviewTabsHeaderProps {
   active: PlatformOverviewTab;
   onTabChange?: (tab: PlatformOverviewTab) => void;
   tabs?: PlatformOverviewTab[];
+  rightSlot?: ReactNode;
+  hideTabs?: boolean;
+  remoteTabsSlotId?: string;
 }
 
 interface PlatformOverviewConfig {
@@ -58,6 +65,14 @@ const CONFIGS: Record<PlatformOverviewHeaderId, PlatformOverviewConfig> = {
   codex: {
     platformLabel: 'Codex',
     overviewIcon: <CodexIcon className="tab-icon" />,
+  },
+  claude: {
+    platformLabel: 'Claude',
+    overviewIcon: <ClaudeIcon className="tab-icon" />,
+  },
+  claude_manager: {
+    platformLabel: 'Claude',
+    overviewIcon: <ClaudeIcon className="tab-icon" />,
   },
   zed: {
     platformLabel: 'Zed',
@@ -110,16 +125,33 @@ export function PlatformOverviewTabsHeader({
   active,
   onTabChange,
   tabs,
+  rightSlot,
+  hideTabs = false,
+  remoteTabsSlotId,
 }: PlatformOverviewTabsHeaderProps) {
   const { t } = useTranslation();
   const { platformGroups } = usePlatformLayoutStore();
+  const remoteHiddenPlatformIds = useRemoteConfigStore((state) => state.hiddenPlatformIds);
   const config = CONFIGS[platform];
   const currentPlatformId = platform as PlatformId;
+  const remoteHiddenPlatformSet = useMemo(
+    () => new Set(remoteHiddenPlatformIds),
+    [remoteHiddenPlatformIds],
+  );
   const currentGroup = useMemo(
     () => findGroupByPlatform(platformGroups, currentPlatformId),
     [platformGroups, currentPlatformId],
   );
-  const switchablePlatforms = currentGroup ? currentGroup.platformIds : [currentPlatformId];
+  const switchablePlatforms = useMemo(
+    () => {
+      const source = currentGroup ? currentGroup.platformIds : [currentPlatformId];
+      const visible = source.filter((platformId) =>
+        platformId === currentPlatformId || !remoteHiddenPlatformSet.has(platformId),
+      );
+      return visible.length > 0 ? visible : [currentPlatformId];
+    },
+    [currentGroup, currentPlatformId, remoteHiddenPlatformSet],
+  );
   const currentPlatformLabel = getPlatformLabel(currentPlatformId, t);
   const currentDisplayName = useMemo(
     () =>
@@ -199,7 +231,13 @@ export function PlatformOverviewTabsHeader({
           <ManualHelpIconButton className="platform-header-help" />
         </div>
         <TopCenterPromoBanner />
-        <div className="page-top-strip-right-placeholder" aria-hidden="true" />
+        {rightSlot ? (
+          <div className="page-top-strip-right page-top-strip-right-slot">
+            {rightSlot}
+          </div>
+        ) : (
+          <div className="page-top-strip-right-placeholder" aria-hidden="true" />
+        )}
       </div>
       <div className="page-tabs-row page-tabs-center page-tabs-row-with-leading">
         <div className="page-tabs-leading">
@@ -211,18 +249,25 @@ export function PlatformOverviewTabsHeader({
             extraOptions={extraSwitchOptions}
           />
         </div>
-        <div className="page-tabs filter-tabs">
-          {tabSpecs.map((tab) => (
-            <button
-              key={tab.key}
-              className={`filter-tab${active === tab.key ? ' active' : ''}`}
-              onClick={() => onTabChange?.(tab.key)}
-            >
-              {tab.icon}
-              <span>{tab.label}</span>
-            </button>
-          ))}
-        </div>
+        {remoteTabsSlotId ? (
+          <div
+            id={remoteTabsSlotId}
+            className="page-tabs filter-tabs platform-remote-tabs-slot"
+          />
+        ) : !hideTabs && (
+          <div className="page-tabs filter-tabs">
+            {tabSpecs.map((tab) => (
+              <button
+                key={tab.key}
+                className={`filter-tab${active === tab.key ? ' active' : ''}`}
+                onClick={() => onTabChange?.(tab.key)}
+              >
+                {tab.icon}
+                <span>{tab.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </>
   );

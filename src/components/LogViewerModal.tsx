@@ -238,7 +238,7 @@ export function LogViewerModal({ open, onClose }: LogViewerModalProps) {
   };
 
   return (
-    <div className="modal-overlay log-viewer-overlay" onClick={onClose}>
+    <div className="modal-overlay log-viewer-overlay">
       <div className="modal log-viewer-modal" onClick={(event) => event.stopPropagation()}>
         <div className="modal-header">
           <h2>{logsLabel}</h2>
@@ -264,7 +264,7 @@ export function LogViewerModal({ open, onClose }: LogViewerModalProps) {
                   >
                     {snapshot.available_files.map((file) => (
                       <option key={file.log_file_name} value={file.log_file_name}>
-                        {file.log_file_name}
+                        {file.log_file_display_name || file.log_file_name}
                       </option>
                     ))}
                   </select>

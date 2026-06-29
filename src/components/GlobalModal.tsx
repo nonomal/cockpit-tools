@@ -18,17 +18,15 @@ export function GlobalModal() {
   const closeModal = useGlobalModalStore((state) => state.closeModal);
 
   const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingActionId, setPendingActionId] = useState<string | null>(null);
 
-  const handleOverlayClick = useCallback(() => {
-    if (!modal || modal.closeOnOverlay === false) return;
-    closeModal();
-  }, [closeModal, modal]);
-
-  useEscClose(visible, closeModal);
+  useEscClose(visible && !pendingActionId, closeModal);
 
   const handleActionClick = useCallback(async (action: GlobalModalAction) => {
-    if (action.disabled) return;
+    if (action.disabled || pendingActionId) return;
+    const actionId = action.id || action.label;
     setActionError(null);
+    setPendingActionId(actionId);
     let hasError = false;
     try {
       if (action.onClick) {
@@ -37,12 +35,15 @@ export function GlobalModal() {
     } catch (err) {
       hasError = true;
       console.error('GlobalModal action error:', err);
-      setActionError(String(err));
+      if (!action.suppressError) {
+        setActionError(err instanceof Error ? err.message : String(err));
+      }
     }
     if (!hasError && action.autoClose !== false) {
       closeModal();
     }
-  }, [closeModal]);
+    setPendingActionId(null);
+  }, [closeModal, pendingActionId]);
 
   if (!visible || !modal) return null;
 
@@ -63,7 +64,7 @@ export function GlobalModal() {
       : 'modal';
 
   return (
-    <div className="modal-overlay global-modal-overlay" onClick={handleOverlayClick}>
+    <div className="modal-overlay global-modal-overlay">
       <div className={modalSizeClass} onClick={(event) => event.stopPropagation()}>
         <div className="modal-header">
           <h2>{modal.title || t('globalModal.title', '提示')}</h2>
@@ -71,6 +72,7 @@ export function GlobalModal() {
             <button
               className="modal-close"
               onClick={closeModal}
+              disabled={Boolean(pendingActionId)}
               aria-label={t('common.close', '关闭')}
             >
               <X />
@@ -104,10 +106,14 @@ export function GlobalModal() {
               key={action.id || `action-${index}`}
               className={resolveActionClass(action.variant)}
               onClick={() => { void handleActionClick(action); }}
-              disabled={action.disabled}
+              disabled={Boolean(pendingActionId) || action.disabled}
               title={action.label}
             >
-              <span className="global-modal-action-label">{action.label}</span>
+              <span className="global-modal-action-label">
+                {pendingActionId === (action.id || action.label)
+                  ? t('common.processing', '处理中...')
+                  : action.label}
+              </span>
             </button>
           ))}
         </div>

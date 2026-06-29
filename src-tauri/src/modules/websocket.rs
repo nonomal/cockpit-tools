@@ -165,7 +165,6 @@ pub struct AccountInfo {
     pub name: Option<String>,
     pub is_current: bool,
     pub disabled: bool,
-    pub has_fingerprint: bool,
     pub last_used: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_tier: Option<String>,
@@ -179,7 +178,6 @@ pub struct AccountTokenInfo {
     pub name: Option<String>,
     pub is_current: bool,
     pub disabled: bool,
-    pub has_fingerprint: bool,
     pub last_used: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_tier: Option<String>,
@@ -257,12 +255,19 @@ fn push_prefix16(prefixes: &mut Vec<(u8, u8)>, ip_str: &str) {
 }
 
 #[cfg(target_os = "windows")]
+fn hidden_wsl_output(args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new("wsl.exe");
+    command.creation_flags(0x08000000);
+    command.args(args).output()
+}
+
+#[cfg(target_os = "windows")]
 fn resolve_wsl_network_prefixes16() -> Vec<(u8, u8)> {
     let mut prefixes = Vec::new();
 
-    let resolv_output = std::process::Command::new("wsl.exe")
-        .args(["-e", "sh", "-c", "cat /etc/resolv.conf"])
-        .output();
+    let resolv_output = hidden_wsl_output(&["-e", "sh", "-c", "cat /etc/resolv.conf"]);
     if let Ok(output) = resolv_output {
         if output.status.success() {
             let content = String::from_utf8_lossy(&output.stdout);
@@ -278,9 +283,7 @@ fn resolve_wsl_network_prefixes16() -> Vec<(u8, u8)> {
         }
     }
 
-    let route_output = std::process::Command::new("wsl.exe")
-        .args(["-e", "sh", "-c", "ip route show default"])
-        .output();
+    let route_output = hidden_wsl_output(&["-e", "sh", "-c", "ip route show default"]);
     if let Ok(output) = route_output {
         if output.status.success() {
             let content = String::from_utf8_lossy(&output.stdout);
@@ -685,32 +688,21 @@ async fn handle_client_message(
             // 异步执行切换
             let server_clone = server.tx.clone();
             tokio::spawn(async move {
-                let dual_no_restart_enabled = crate::modules::config::get_user_config()
-                    .antigravity_dual_switch_no_restart_enabled;
-                let switch_result = if dual_no_restart_enabled {
-                    crate::modules::account::switch_account_dual_no_restart(
-                        &account_id,
-                        "manual",
-                        "tools.ws.request_switch_account",
-                        "ws_request_switch_account",
-                        None,
-                    )
-                    .await
-                } else {
-                    crate::modules::account::switch_account_internal(&account_id).await
-                };
+                let switch_result = crate::modules::platform_adapter::call_antigravity_series::<
+                    crate::models::Account,
+                >(
+                    "switch.inject",
+                    serde_json::json!({ "accountId": account_id }),
+                );
 
                 match switch_result {
                     Ok(account) => {
-                        // 无感双通道链路内已广播 account_switched，这里避免重复广播。
-                        if !dual_no_restart_enabled {
-                            let msg = WsMessage::AccountSwitched {
-                                account_id: account.id,
-                                email: account.email,
-                            };
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                let _ = server_clone.send(json);
-                            }
+                        let msg = WsMessage::AccountSwitched {
+                            account_id: account.id,
+                            email: account.email,
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = server_clone.send(json);
                         }
                         // 通知 Tools 前端刷新当前账号与账号列表，避免插件端切换后 UI 仍显示旧标识。
                         broadcast_data_changed("ws_switch_account");
@@ -893,10 +885,13 @@ async fn handle_client_message(
 
 /// 获取账号列表信息
 fn get_accounts_info() -> Result<(Vec<AccountInfo>, Option<String>), String> {
-    use crate::modules::account;
-
-    let accounts = account::list_accounts()?;
-    let current_id = account::get_current_account_id()?;
+    let accounts = crate::modules::platform_adapter::call_antigravity_series::<
+        Vec<crate::models::Account>,
+    >("accounts.list", serde_json::json!({}))?;
+    let current = crate::modules::platform_adapter::call_antigravity_series::<
+        Option<crate::models::Account>,
+    >("accounts.current", serde_json::json!({}))?;
+    let current_id = current.map(|account| account.id);
 
     let account_infos: Vec<AccountInfo> = accounts
         .iter()
@@ -911,7 +906,6 @@ fn get_accounts_info() -> Result<(Vec<AccountInfo>, Option<String>), String> {
                 name: acc.name.clone(),
                 is_current: current_id.as_ref() == Some(&acc.id),
                 disabled: acc.disabled,
-                has_fingerprint: acc.fingerprint_id.is_some(),
                 last_used: acc.last_used,
                 subscription_tier,
             }
@@ -923,10 +917,13 @@ fn get_accounts_info() -> Result<(Vec<AccountInfo>, Option<String>), String> {
 
 /// 获取账号列表信息（包含 Token）
 fn get_accounts_with_tokens_info() -> Result<(Vec<AccountTokenInfo>, Option<String>), String> {
-    use crate::modules::account;
-
-    let accounts = account::list_accounts()?;
-    let current_id = account::get_current_account_id()?;
+    let accounts = crate::modules::platform_adapter::call_antigravity_series::<
+        Vec<crate::models::Account>,
+    >("accounts.list", serde_json::json!({}))?;
+    let current = crate::modules::platform_adapter::call_antigravity_series::<
+        Option<crate::models::Account>,
+    >("accounts.current", serde_json::json!({}))?;
+    let current_id = current.map(|account| account.id);
 
     let account_infos: Vec<AccountTokenInfo> = accounts
         .iter()
@@ -941,7 +938,6 @@ fn get_accounts_with_tokens_info() -> Result<(Vec<AccountTokenInfo>, Option<Stri
                 name: acc.name.clone(),
                 is_current: current_id.as_ref() == Some(&acc.id),
                 disabled: acc.disabled,
-                has_fingerprint: acc.fingerprint_id.is_some(),
                 last_used: acc.last_used,
                 subscription_tier,
                 refresh_token: acc.token.refresh_token.clone(),
@@ -957,10 +953,10 @@ fn get_accounts_with_tokens_info() -> Result<(Vec<AccountTokenInfo>, Option<Stri
 
 /// 获取当前账号信息
 fn get_current_account_info() -> Result<Option<AccountInfo>, String> {
-    use crate::modules::account;
-
-    let current = account::get_current_account()?;
-    let current_id = account::get_current_account_id()?;
+    let current = crate::modules::platform_adapter::call_antigravity_series::<
+        Option<crate::models::Account>,
+    >("accounts.current", serde_json::json!({}))?;
+    let current_id = current.as_ref().map(|account| account.id.clone());
 
     Ok(current.map(|acc| {
         let subscription_tier = acc
@@ -973,7 +969,6 @@ fn get_current_account_info() -> Result<Option<AccountInfo>, String> {
             name: acc.name.clone(),
             is_current: current_id.as_ref() == Some(&acc.id),
             disabled: acc.disabled,
-            has_fingerprint: acc.fingerprint_id.is_some(),
             last_used: acc.last_used,
             subscription_tier,
         }
@@ -987,27 +982,11 @@ fn handle_add_account(
     access_token: Option<&str>,
     expires_at: Option<i64>,
 ) -> Result<String, String> {
-    use crate::models::TokenData;
-    use crate::modules::account;
-
-    // 计算 expires_in（如果提供了 expires_at，计算距离现在的秒数）
-    let expires_in = expires_at
-        .map(|ts| ts - chrono::Utc::now().timestamp())
-        .filter(|&secs| secs > 0)
-        .unwrap_or(3600); // 默认 1 小时
-
-    // 使用 TokenData::new 构建
-    let token = TokenData::new(
-        access_token.unwrap_or("").to_string(),
-        refresh_token.to_string(),
-        expires_in,
-        Some(email.to_string()),
-        None,
-        None,
-    );
-
-    // 使用 upsert_account 添加或更新账号
-    account::upsert_account(email.to_string(), None, token)?;
+    let _ = (email, access_token, expires_at);
+    crate::modules::platform_adapter::call_antigravity_series::<crate::models::Account>(
+        "accounts.addRefreshToken",
+        serde_json::json!({ "refreshToken": refresh_token }),
+    )?;
 
     crate::modules::logger::log_info("[WS] 账号已同步");
     Ok(format!("账号已同步: {}", email))
@@ -1015,15 +994,18 @@ fn handle_add_account(
 
 /// 处理删除账号请求（按邮箱）
 fn handle_delete_account_by_email(email: &str) -> Result<String, String> {
-    use crate::modules::account;
-
     // 查找账号 ID
-    let accounts = account::list_accounts()?;
+    let accounts = crate::modules::platform_adapter::call_antigravity_series::<
+        Vec<crate::models::Account>,
+    >("accounts.list", serde_json::json!({}))?;
     let target = accounts.iter().find(|a| a.email == email);
 
     match target {
         Some(acc) => {
-            account::delete_account(&acc.id)?;
+            crate::modules::platform_adapter::call_antigravity_series::<()>(
+                "accounts.delete",
+                serde_json::json!({ "accountId": acc.id.clone() }),
+            )?;
             crate::modules::logger::log_info("[WS] 账号已删除");
             Ok(format!("账号已删除: {}", email))
         }

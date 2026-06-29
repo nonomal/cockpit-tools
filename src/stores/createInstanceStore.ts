@@ -6,6 +6,10 @@ import {
   InstanceProfile,
 } from "../types/instance";
 import type { CodexAppSpeed } from "../types/codex";
+import { withTimeout } from "../utils/promiseTimeout";
+
+export const INSTANCE_LIST_TIMEOUT_ERROR = "INSTANCE_LIST_TIMEOUT";
+const INSTANCE_LIST_TIMEOUT_MS = 12_000;
 
 export type InstanceStoreState = {
   instances: InstanceProfile[];
@@ -35,6 +39,7 @@ export type InstanceStoreState = {
     followLocalAccount?: boolean;
     launchMode?: InstanceLaunchMode;
     appSpeed?: CodexAppSpeed;
+    autoSyncThreads?: boolean;
   }) => Promise<InstanceProfile>;
   deleteInstance: (instanceId: string) => Promise<void>;
   startInstance: (instanceId: string) => Promise<InstanceProfile>;
@@ -66,6 +71,7 @@ type InstanceService = {
     followLocalAccount?: boolean;
     launchMode?: InstanceLaunchMode;
     appSpeed?: CodexAppSpeed;
+    autoSyncThreads?: boolean;
   }) => Promise<InstanceProfile>;
   deleteInstance: (instanceId: string) => Promise<void>;
   startInstance: (instanceId: string) => Promise<InstanceProfile>;
@@ -106,7 +112,11 @@ export function createInstanceStore(
     fetchInstances: async () => {
       set({ loading: true, error: null });
       try {
-        const instances = await service.listInstances();
+        const instances = await withTimeout(
+          service.listInstances(),
+          INSTANCE_LIST_TIMEOUT_MS,
+          INSTANCE_LIST_TIMEOUT_ERROR,
+        );
         set({ instances, loading: false });
         persistInstancesCache(instances);
       } catch (e) {
@@ -117,7 +127,11 @@ export function createInstanceStore(
     refreshInstances: async () => {
       set({ error: null });
       try {
-        const instances = await service.listInstances();
+        const instances = await withTimeout(
+          service.listInstances(),
+          INSTANCE_LIST_TIMEOUT_MS,
+          INSTANCE_LIST_TIMEOUT_ERROR,
+        );
         set({ instances });
         persistInstancesCache(instances);
         return instances;
@@ -154,8 +168,18 @@ export function createInstanceStore(
     },
 
     startInstance: async (instanceId) => {
+      const flowStartedAt = performance.now();
+      console.info("[Instance Start][Store] startInstance started", { instanceId });
       const instance = await service.startInstance(instanceId);
+      console.info("[Instance Start][Store] service.startInstance finished", {
+        instanceId,
+        elapsedMs: Math.round(performance.now() - flowStartedAt),
+      });
       await get().fetchInstances();
+      console.info("[Instance Start][Store] fetchInstances after start finished", {
+        instanceId,
+        elapsedMs: Math.round(performance.now() - flowStartedAt),
+      });
       return instance;
     },
 
